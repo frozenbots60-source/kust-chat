@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from redis import asyncio as aioredis
 
-app = FastAPI(title="Kustify Ultra", description="Premium Animated Chat", version="5.0")
+app = FastAPI(title="Kustify Ultra", description="Premium Animated Chat", version="6.0")
 
 # --- CONFIGURATION ---
 
@@ -25,8 +25,10 @@ BUCKET_NAME = os.getenv("BUCKETEER_BUCKET_NAME")
 
 # --- INITIALIZATION ---
 
+# Initialize Redis
 redis = aioredis.from_url(REDIS_URL, decode_responses=True)
 
+# Initialize S3
 s3_client = boto3.client(
     's3',
     aws_access_key_id=AWS_ACCESS_KEY,
@@ -34,8 +36,8 @@ s3_client = boto3.client(
     region_name=AWS_REGION
 )
 
-GLOBAL_CHANNEL = "kustify_global_v5"
-GROUPS_KEY = "kustify:groups_v5"
+GLOBAL_CHANNEL = "kustify_global_v6"
+GROUPS_KEY = "kustify:groups_v6"
 
 # --- MODELS ---
 
@@ -46,10 +48,11 @@ class GroupCreate(BaseModel):
 
 class ConnectionManager:
     def __init__(self):
+        # Stores active websocket connections: {group_id: [WebSocket, ...]}
         self.active_connections: Dict[str, List[WebSocket]] = {}
 
     async def connect(self, websocket: WebSocket, group_id: str):
-        await websocket.accept()
+        # NOTE: websocket.accept() is called in the endpoint now for safety
         if group_id not in self.active_connections:
             self.active_connections[group_id] = []
         self.active_connections[group_id].append(websocket)
@@ -62,33 +65,40 @@ class ConnectionManager:
     async def broadcast(self, group_id: str, message: dict):
         if group_id in self.active_connections:
             data = json.dumps(message)
-            for connection in self.active_connections[group_id]:
+            # Iterate over a copy to avoid modification issues during iteration
+            for connection in self.active_connections[group_id].copy():
                 try:
                     await connection.send_text(data)
-                except:
+                except Exception:
+                    # If sending fails, assume dead connection
                     pass
 
 manager = ConnectionManager()
 
-# --- BACKGROUND WORKER ---
+# --- BACKGROUND WORKER (REDIS SYNC) ---
 
 async def redis_listener():
     pubsub = redis.pubsub()
     await pubsub.subscribe(GLOBAL_CHANNEL)
     async for message in pubsub.listen():
         if message["type"] == "message":
-            data = json.loads(message["data"])
-            group_id = data.get("group_id")
-            if group_id:
-                await manager.broadcast(group_id, data)
+            try:
+                data = json.loads(message["data"])
+                group_id = data.get("group_id")
+                if group_id:
+                    await manager.broadcast(group_id, data)
+            except:
+                pass
 
 @app.on_event("startup")
 async def startup_event():
+    # Ensure General group exists
     if not await redis.sismember(GROUPS_KEY, "General"):
         await redis.sadd(GROUPS_KEY, "General")
+    # Start Redis Listener
     asyncio.create_task(redis_listener())
 
-# --- API ---
+# --- API ENDPOINTS ---
 
 @app.get("/api/groups")
 async def get_groups():
@@ -109,7 +119,7 @@ async def get_history(group_id: str, limit: int = 50):
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
-        file_key = f"kustify_v5/{file.filename}"
+        file_key = f"kustify_v6/{file.filename}"
         s3_client.upload_fileobj(
             file.file, BUCKET_NAME, file_key,
             ExtraArgs={'ContentType': file.content_type}
@@ -123,13 +133,19 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# --- WEBSOCKET ---
+# --- WEBSOCKET ENDPOINT (FIXED) ---
 
 @app.websocket("/ws/{group_id}/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
+    # 1. Accept Connection IMMEDIATELY
+    await websocket.accept()
+    
+    # 2. Register with Manager
     await manager.connect(websocket, group_id)
+    
     try:
         while True:
+            # 3. Receive Data
             raw = await websocket.receive_text()
             data = json.loads(raw)
             mtype = data.get("type")
@@ -149,17 +165,29 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
                     "image_url": data.get("image_url"),
                     "timestamp": data.get("timestamp")
                 }
-                # Save & Publish
+                # Save to Redis History
                 await redis.rpush(f"kustify:history:{group_id}", json.dumps(out))
+                # Publish to Redis (syncs across workers)
                 await redis.publish(GLOBAL_CHANNEL, json.dumps(out))
 
             elif mtype in ["vc_signal", "vc_update", "vc_talking"]:
+                # Attach sender ID and broadcast to local group immediately
                 data["sender_id"] = user_id
+                
+                # IMPORTANT: For VC, we usually just need local broadcast if on same server,
+                # BUT if you scale to multiple dynos, you need Redis.
+                # For now, we broadcast to the group directly to be fast.
+                # If you need multi-dyno VC sync, uncomment the redis publish line below.
                 await manager.broadcast(group_id, data)
+                # await redis.publish(GLOBAL_CHANNEL, json.dumps(data)) # Optional: Enable for multi-server VC sync
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, group_id)
+        # Notify others
         await manager.broadcast(group_id, {"type": "user_left", "user_id": user_id})
+    except Exception as e:
+        print(f"Error: {e}")
+        manager.disconnect(websocket, group_id)
 
 # --- FRONTEND ---
 
@@ -204,9 +232,7 @@ html_content = """
             overflow: hidden;
         }
 
-        /* --- UI COMPONENTS --- */
-        
-        /* Sidebar */
+        /* --- SIDEBAR --- */
         #sidebar {
             width: 300px;
             background: var(--bg-glass);
@@ -250,7 +276,7 @@ html_content = """
         }
         .create-btn:hover { border-color: var(--primary); color: var(--primary); background: rgba(139, 92, 246, 0.05); }
 
-        /* Chat Area */
+        /* --- CHAT AREA --- */
         #chat-area {
             flex: 1; display: flex; flex-direction: column;
             position: relative; background: transparent;
@@ -338,7 +364,7 @@ html_content = """
             z-index: 100; display: none; justify-content: center; align-items: center;
         }
         
-        /* FLOATING VC WIDGET (NEW) */
+        /* --- VC WIDGET (FLOATING) --- */
         #vc-widget {
             position: fixed; top: 80px; right: 20px;
             width: 320px; background: rgba(24, 24, 27, 0.95);
@@ -356,7 +382,7 @@ html_content = """
         .vc-header {
             padding: 15px; border-bottom: 1px solid var(--border);
             display: flex; justify-content: space-between; align-items: center;
-            cursor: move; /* Drag handle */
+            cursor: move;
         }
 
         .vc-grid {
@@ -519,7 +545,7 @@ html_content = """
         let dataArray = null;
         let micLoop = null;
         let isMuted = false;
-        let isMinimized = false;
+        let joinedUsers = new Set();
 
         // --- INIT ---
         window.onload = () => {
@@ -593,11 +619,11 @@ html_content = """
             }
         }
 
-        // --- CHAT ---
+        // --- CHAT LOGIC ---
         function connect(group) {
             if(state.ws) state.ws.close();
             if(state.hb) clearInterval(state.hb);
-            leaveVoice(); // Clean leave on switch
+            leaveVoice();
 
             state.group = group;
             document.getElementById('header-title').innerText = `# ${group}`;
@@ -678,16 +704,14 @@ html_content = """
             finally { btn.innerHTML = old; document.getElementById('file-input').value = ''; }
         }
 
-        // --- VOICE CHAT (FLOATING & HIGH QUALITY) ---
+        // --- VC LOGIC ---
         
         function joinVoice() {
-            // HIGH QUALITY AUDIO CONSTRAINTS TO FIX GLITCHES/LOW VOLUME
             const constraints = {
                 audio: {
                     echoCancellation: true,
                     noiseSuppression: true,
-                    autoGainControl: true,
-                    channelCount: 2
+                    autoGainControl: true
                 },
                 video: false
             };
@@ -696,35 +720,29 @@ html_content = """
                 myStream = stream;
                 isMuted = false;
                 
-                // Show Floating Widget
                 document.getElementById('vc-widget').style.display = 'flex';
                 document.getElementById('vc-widget').classList.remove('minimized');
                 
-                // Add Self
                 addVcUser(state.uid, state.user, state.pfp);
                 
-                // Audio Context for Visualizer
                 audioCtx = new (window.AudioContext || window.webkitAudioContext)();
                 const src = audioCtx.createMediaStreamSource(stream);
                 analyser = audioCtx.createAnalyser();
                 analyser.fftSize = 64;
                 src.connect(analyser);
                 dataArray = new Uint8Array(analyser.frequencyBinCount);
-                
                 startVisualizerLoop();
 
-                // PeerJS
                 peer = new Peer(state.uid);
                 peer.on('open', () => {
+                    // Signal everyone that I joined
                     sendVc({type: "vc_signal", payload: {event: "join"}});
                 });
                 
                 peer.on('call', call => {
                     call.answer(stream);
                     const aud = document.createElement('audio');
-                    // ENSURE AUDIO PLAYS LOUDLY
                     aud.autoplay = true;
-                    aud.controls = false;
                     call.on('stream', s => playStream(aud, s));
                 });
             }).catch(e => alert("Mic Error: " + e));
@@ -738,16 +756,29 @@ html_content = """
             if(d.sender_id === state.uid) return;
             
             if(d.type === "vc_signal") {
-                if(d.payload.event === "join") {
+                const p = d.payload;
+                
+                if(p.event === "join") {
+                    // New user joined: Add them to UI
                     addVcUser(d.sender_id, d.sender_name, d.sender_pfp);
+                    
+                    // Call them
                     const call = peer.call(d.sender_id, myStream);
                     const aud = document.createElement('audio');
                     aud.autoplay = true;
                     call.on('stream', s => playStream(aud, s));
+                    
+                    // Respond with ACK so they know I'm here
                     sendVc({type: "vc_signal", payload: {event: "ack"}, target_id: d.sender_id});
                 }
-                if(d.payload.event === "ack") {
+                
+                if(p.event === "ack") {
+                    // Existing user responded: Add them to UI
                     addVcUser(d.sender_id, d.sender_name, d.sender_pfp);
+                }
+                
+                if(p.event === "leave") {
+                    removeVcUser(d.sender_id);
                 }
             }
             
@@ -767,30 +798,10 @@ html_content = """
             }
         }
 
-        function startVisualizerLoop() {
-            micLoop = setInterval(() => {
-                if(!analyser || isMuted) return;
-                analyser.getByteFrequencyData(dataArray);
-                let sum = 0;
-                for(let i=0; i<dataArray.length; i++) sum += dataArray[i];
-                const avg = sum / dataArray.length;
-                
-                // Animate self
-                const ring = document.getElementById(`ring-${state.uid}`);
-                if(ring) {
-                    const scale = 1 + (avg / 100);
-                    ring.style.opacity = avg > 5 ? 0.8 : 0;
-                    ring.style.width = `${50 * scale}px`;
-                    ring.style.height = `${50 * scale}px`;
-                }
-                
-                // Broadcast volume
-                if(avg > 5) sendVc({type: "vc_talking", vol: avg});
-            }, 100);
-        }
-
         function addVcUser(uid, name, pfp) {
-            if(document.getElementById(`vc-u-${uid}`)) return;
+            if(joinedUsers.has(uid)) return;
+            joinedUsers.add(uid);
+            
             const grid = document.getElementById('vc-grid');
             const div = document.createElement('div');
             div.className = 'vc-user';
@@ -806,10 +817,37 @@ html_content = """
             grid.appendChild(div);
         }
 
+        function removeVcUser(uid) {
+            if(joinedUsers.has(uid)) {
+                joinedUsers.delete(uid);
+                const el = document.getElementById(`vc-u-${uid}`);
+                if(el) el.remove();
+            }
+        }
+
+        function startVisualizerLoop() {
+            micLoop = setInterval(() => {
+                if(!analyser || isMuted) return;
+                analyser.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for(let i=0; i<dataArray.length; i++) sum += dataArray[i];
+                const avg = sum / dataArray.length;
+                
+                const ring = document.getElementById(`ring-${state.uid}`);
+                if(ring) {
+                    const scale = 1 + (avg / 100);
+                    ring.style.opacity = avg > 5 ? 0.8 : 0;
+                    ring.style.width = `${50 * scale}px`;
+                    ring.style.height = `${50 * scale}px`;
+                }
+                if(avg > 5) sendVc({type: "vc_talking", vol: avg});
+            }, 100);
+        }
+
         function playStream(aud, s) {
             aud.srcObject = s;
             aud.addEventListener('loadedmetadata', () => {
-                aud.play().catch(e => console.log("Auto-play blocked", e));
+                aud.play().catch(console.log);
             });
             document.getElementById('audio-container').appendChild(aud);
         }
@@ -819,13 +857,15 @@ html_content = """
             myStream.getAudioTracks()[0].enabled = !isMuted;
             document.getElementById('mute-btn').style.background = isMuted ? '#fff' : '#27272a';
             document.getElementById('mute-btn').style.color = isMuted ? '#000' : '#fff';
-            
             document.getElementById(`mic-${state.uid}`).style.display = isMuted ? 'flex' : 'none';
             sendVc({type: "vc_update", muted: isMuted});
         }
 
         function leaveVoice() {
-            if(peer) peer.destroy();
+            if(peer) {
+                sendVc({type: "vc_signal", payload: {event: "leave"}});
+                peer.destroy();
+            }
             if(myStream) myStream.getTracks().forEach(t => t.stop());
             if(micLoop) clearInterval(micLoop);
             if(audioCtx) audioCtx.close();
@@ -833,37 +873,51 @@ html_content = """
             document.getElementById('vc-widget').style.display = 'none';
             document.getElementById('vc-grid').innerHTML = '';
             document.getElementById('audio-container').innerHTML = '';
+            joinedUsers.clear();
         }
 
-        // --- FLOATING WIDGET LOGIC ---
-        
         function toggleVcSize() {
-            const w = document.getElementById('vc-widget');
-            w.classList.toggle('minimized');
+            document.getElementById('vc-widget').classList.toggle('minimized');
         }
 
         function dragElement(elmnt) {
             var pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
             if (document.getElementById("vc-header")) {
                 document.getElementById("vc-header").onmousedown = dragMouseDown;
+                document.getElementById("vc-header").ontouchstart = dragMouseDown; // Mobile touch
             } 
 
             function dragMouseDown(e) {
                 e = e || window.event;
-                e.preventDefault();
-                pos3 = e.clientX;
-                pos4 = e.clientY;
+                // e.preventDefault(); // Don't block default to allow clicks
+                if(e.type === 'touchstart') {
+                    pos3 = e.touches[0].clientX;
+                    pos4 = e.touches[0].clientY;
+                } else {
+                    pos3 = e.clientX;
+                    pos4 = e.clientY;
+                }
                 document.onmouseup = closeDragElement;
                 document.onmousemove = elementDrag;
+                document.ontouchend = closeDragElement;
+                document.ontouchmove = elementDrag;
             }
 
             function elementDrag(e) {
                 e = e || window.event;
                 e.preventDefault();
-                pos1 = pos3 - e.clientX;
-                pos2 = pos4 - e.clientY;
-                pos3 = e.clientX;
-                pos4 = e.clientY;
+                let cx, cy;
+                if(e.type === 'touchmove') {
+                    cx = e.touches[0].clientX;
+                    cy = e.touches[0].clientY;
+                } else {
+                    cx = e.clientX;
+                    cy = e.clientY;
+                }
+                pos1 = pos3 - cx;
+                pos2 = pos4 - cy;
+                pos3 = cx;
+                pos4 = cy;
                 elmnt.style.top = (elmnt.offsetTop - pos2) + "px";
                 elmnt.style.left = (elmnt.offsetLeft - pos1) + "px";
                 elmnt.style.right = "auto"; 
@@ -872,10 +926,10 @@ html_content = """
             function closeDragElement() {
                 document.onmouseup = null;
                 document.onmousemove = null;
+                document.ontouchend = null;
+                document.ontouchmove = null;
             }
         }
-
     </script>
 </body>
 </html>
-"""
