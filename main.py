@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from redis import asyncio as aioredis
 
-app = FastAPI(title="Kustify Ultra", description="Premium Animated Chat", version="4.0")
+app = FastAPI(title="Kustify Ultra", description="Premium Animated Chat", version="5.0")
 
 # --- CONFIGURATION ---
 
@@ -34,8 +34,8 @@ s3_client = boto3.client(
     region_name=AWS_REGION
 )
 
-GLOBAL_CHANNEL = "kustify_global_v4"
-GROUPS_KEY = "kustify:groups_v4"
+GLOBAL_CHANNEL = "kustify_global_v5"
+GROUPS_KEY = "kustify:groups_v5"
 
 # --- MODELS ---
 
@@ -109,7 +109,7 @@ async def get_history(group_id: str, limit: int = 50):
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
-        file_key = f"kustify_v4/{file.filename}"
+        file_key = f"kustify_v5/{file.filename}"
         s3_client.upload_fileobj(
             file.file, BUCKET_NAME, file_key,
             ExtraArgs={'ContentType': file.content_type}
@@ -154,7 +154,6 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
                 await redis.publish(GLOBAL_CHANNEL, json.dumps(out))
 
             elif mtype in ["vc_signal", "vc_update", "vc_talking"]:
-                # Pass-through for WebRTC signaling and visualizer data
                 data["sender_id"] = user_id
                 await manager.broadcast(group_id, data)
 
@@ -337,62 +336,84 @@ html_content = """
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
             background: rgba(0,0,0,0.8); backdrop-filter: blur(8px);
             z-index: 100; display: none; justify-content: center; align-items: center;
-            animation: fadeIn 0.3s ease;
-        }
-        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-
-        .modal-box {
-            background: #18181b; width: 90%; max-width: 420px;
-            padding: 30px; border-radius: 24px; border: 1px solid var(--border);
-            box-shadow: 0 20px 50px rgba(0,0,0,0.5);
-            text-align: center;
-            animation: scaleUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-        }
-        @keyframes scaleUp { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-
-        .modal-box input {
-            width: 100%; padding: 14px; margin: 20px 0; background: #09090b;
-            border: 1px solid var(--border); border-radius: 12px; color: white;
-        }
-        .modal-box button {
-            width: 100%; padding: 14px; background: var(--primary); border: none;
-            border-radius: 12px; color: white; font-weight: bold; cursor: pointer;
-        }
-
-        /* --- VOICE CHAT --- */
-        .vc-grid {
-            display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
-            gap: 20px; margin: 20px 0; max-height: 400px; overflow-y: auto;
         }
         
+        /* FLOATING VC WIDGET (NEW) */
+        #vc-widget {
+            position: fixed; top: 80px; right: 20px;
+            width: 320px; background: rgba(24, 24, 27, 0.95);
+            backdrop-filter: blur(15px);
+            border: 1px solid var(--border); border-radius: 20px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+            z-index: 90; display: none; flex-direction: column;
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        
+        #vc-widget.minimized {
+            width: 200px; top: auto; bottom: 20px;
+        }
+
+        .vc-header {
+            padding: 15px; border-bottom: 1px solid var(--border);
+            display: flex; justify-content: space-between; align-items: center;
+            cursor: move; /* Drag handle */
+        }
+
+        .vc-grid {
+            display: grid; grid-template-columns: repeat(3, 1fr);
+            gap: 10px; padding: 15px; max-height: 300px; overflow-y: auto;
+        }
+        
+        #vc-widget.minimized .vc-grid, 
+        #vc-widget.minimized .vc-controls { display: none; }
+
         .vc-user {
-            display: flex; flex-direction: column; align-items: center; gap: 8px;
+            display: flex; flex-direction: column; align-items: center; gap: 5px;
         }
         
         .vc-avatar-container {
-            position: relative; width: 80px; height: 80px;
+            position: relative; width: 60px; height: 60px;
             display: flex; justify-content: center; align-items: center;
         }
         
         .vc-avatar {
-            width: 70px; height: 70px; border-radius: 50%; object-fit: cover;
-            z-index: 2; border: 3px solid #27272a;
+            width: 50px; height: 50px; border-radius: 50%; object-fit: cover;
+            z-index: 2; border: 2px solid #27272a;
         }
 
-        /* The Visualizer Ring */
         .vc-ring {
             position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            width: 70px; height: 70px; border-radius: 50%;
+            width: 50px; height: 50px; border-radius: 50%;
             background: var(--primary); opacity: 0; z-index: 1;
             transition: width 0.05s, height 0.05s, opacity 0.1s;
         }
 
         .vc-mic-status {
-            position: absolute; bottom: 0; right: 0; width: 24px; height: 24px;
-            background: #ef4444; border-radius: 50%; border: 3px solid #18181b;
-            display: flex; align-items: center; justify-content: center; font-size: 10px;
-            z-index: 3;
+            position: absolute; bottom: 0; right: 0; width: 18px; height: 18px;
+            background: #ef4444; border-radius: 50%; border: 2px solid #18181b;
+            display: flex; align-items: center; justify-content: center; font-size: 8px; z-index: 3;
         }
+
+        .vc-controls {
+            padding: 15px; border-top: 1px solid var(--border);
+            display: flex; justify-content: center; gap: 15px;
+        }
+        
+        .vc-circle-btn {
+            width: 40px; height: 40px; border-radius: 50%; border: none;
+            display: flex; align-items: center; justify-content: center; cursor: pointer;
+            transition: 0.2s;
+        }
+        .vc-circle-btn:hover { transform: scale(1.1); }
+
+        /* Setup Modal */
+        .modal-box {
+            background: #18181b; width: 90%; max-width: 420px;
+            padding: 30px; border-radius: 24px; border: 1px solid var(--border);
+            text-align: center;
+        }
+        .modal-box input { width: 100%; padding: 14px; margin: 20px 0; background: #09090b; border: 1px solid var(--border); border-radius: 12px; color: white; }
+        .modal-box button { width: 100%; padding: 14px; background: var(--primary); border: none; border-radius: 12px; color: white; font-weight: bold; cursor: pointer; }
 
         /* --- MOBILE --- */
         @media (max-width: 768px) {
@@ -400,6 +421,7 @@ html_content = """
             #sidebar.open { transform: translateX(0); }
             .menu-btn { display: block; background: none; border: none; color: white; font-size: 1.5rem; margin-right: 15px; }
             .message { max-width: 90%; }
+            #vc-widget { width: 90%; top: 60px; right: 5%; }
         }
         @media (min-width: 769px) { .menu-btn { display: none; } }
 
@@ -411,31 +433,32 @@ html_content = """
         <div class="modal-box">
             <h2 style="font-weight: 800; font-size: 2rem; margin-bottom: 5px;">Kustify</h2>
             <p style="color: var(--text-muted);">Set up your profile</p>
-            
             <div style="margin: 20px auto; width: 100px; height: 100px; position: relative;">
                 <img id="preview-pfp" src="https://ui-avatars.com/api/?background=random" style="width: 100%; height: 100%; border-radius: 50%; object-fit: cover;">
                 <label for="pfp-upload" style="position: absolute; bottom: 0; right: 0; background: var(--primary); width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer;">📷</label>
                 <input type="file" id="pfp-upload" style="display: none;" onchange="uploadPfp()">
             </div>
-
             <input type="text" id="username-input" placeholder="Display Name">
             <button onclick="saveProfile()">Enter Kustify</button>
         </div>
     </div>
 
-    <div id="vc-modal" class="modal-overlay">
-        <div class="modal-box" style="max-width: 600px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                <h3>Voice Chat</h3>
-                <span style="background: #064e3b; color: #34d399; padding: 4px 10px; border-radius: 20px; font-size: 0.8rem;">● Live</span>
+    <div id="vc-widget">
+        <div class="vc-header" id="vc-header">
+            <div style="display:flex; align-items:center; gap:8px;">
+                <span style="background: #064e3b; color: #34d399; width: 8px; height: 8px; border-radius: 50%;"></span>
+                <span style="font-weight: bold; font-size: 0.9rem;">Voice Chat</span>
             </div>
-            
-            <div class="vc-grid" id="vc-grid"></div>
-            
-            <div style="display: flex; justify-content: center; gap: 15px; margin-top: 20px;">
-                <button onclick="toggleMute()" id="mute-btn" style="width: 50px; background: #27272a;">🎤</button>
-                <button onclick="leaveVoice()" style="width: 50px; background: #ef4444;">❌</button>
+            <div style="display:flex; gap:10px;">
+                <button onclick="toggleVcSize()" style="background:none; border:none; color:var(--text-muted); cursor:pointer;">_</button>
             </div>
+        </div>
+        
+        <div class="vc-grid" id="vc-grid"></div>
+        
+        <div class="vc-controls">
+            <button class="vc-circle-btn" onclick="toggleMute()" id="mute-btn" style="background: #27272a;">🎤</button>
+            <button class="vc-circle-btn" onclick="leaveVoice()" style="background: #ef4444;">❌</button>
         </div>
     </div>
 
@@ -459,7 +482,7 @@ html_content = """
                 <h3 id="header-title"># General</h3>
             </div>
             <button class="vc-btn" onclick="joinVoice()">
-                <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
+                <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
                 Join Voice
             </button>
         </div>
@@ -496,6 +519,7 @@ html_content = """
         let dataArray = null;
         let micLoop = null;
         let isMuted = false;
+        let isMinimized = false;
 
         // --- INIT ---
         window.onload = () => {
@@ -506,6 +530,7 @@ html_content = """
             } else {
                 document.getElementById('preview-pfp').src = state.pfp;
             }
+            dragElement(document.getElementById("vc-widget"));
         };
 
         async function uploadPfp() {
@@ -572,7 +597,7 @@ html_content = """
         function connect(group) {
             if(state.ws) state.ws.close();
             if(state.hb) clearInterval(state.hb);
-            leaveVoice();
+            leaveVoice(); // Clean leave on switch
 
             state.group = group;
             document.getElementById('header-title').innerText = `# ${group}`;
@@ -653,13 +678,27 @@ html_content = """
             finally { btn.innerHTML = old; document.getElementById('file-input').value = ''; }
         }
 
-        // --- VC (VISUALIZER & LOGIC) ---
+        // --- VOICE CHAT (FLOATING & HIGH QUALITY) ---
         
         function joinVoice() {
-            navigator.mediaDevices.getUserMedia({audio: true}).then(stream => {
+            // HIGH QUALITY AUDIO CONSTRAINTS TO FIX GLITCHES/LOW VOLUME
+            const constraints = {
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                    channelCount: 2
+                },
+                video: false
+            };
+
+            navigator.mediaDevices.getUserMedia(constraints).then(stream => {
                 myStream = stream;
                 isMuted = false;
-                document.getElementById('vc-modal').style.display = 'flex';
+                
+                // Show Floating Widget
+                document.getElementById('vc-widget').style.display = 'flex';
+                document.getElementById('vc-widget').classList.remove('minimized');
                 
                 // Add Self
                 addVcUser(state.uid, state.user, state.pfp);
@@ -683,9 +722,12 @@ html_content = """
                 peer.on('call', call => {
                     call.answer(stream);
                     const aud = document.createElement('audio');
+                    // ENSURE AUDIO PLAYS LOUDLY
+                    aud.autoplay = true;
+                    aud.controls = false;
                     call.on('stream', s => playStream(aud, s));
                 });
-            }).catch(e => alert("Mic blocked"));
+            }).catch(e => alert("Mic Error: " + e));
         }
 
         function sendVc(data) {
@@ -700,6 +742,7 @@ html_content = """
                     addVcUser(d.sender_id, d.sender_name, d.sender_pfp);
                     const call = peer.call(d.sender_id, myStream);
                     const aud = document.createElement('audio');
+                    aud.autoplay = true;
                     call.on('stream', s => playStream(aud, s));
                     sendVc({type: "vc_signal", payload: {event: "ack"}, target_id: d.sender_id});
                 }
@@ -709,13 +752,12 @@ html_content = """
             }
             
             if(d.type === "vc_talking") {
-                // Animate other user's ring based on volume
                 const ring = document.getElementById(`ring-${d.sender_id}`);
                 if(ring) {
                     const scale = 1 + (d.vol / 100);
                     ring.style.opacity = d.vol > 5 ? 0.8 : 0;
-                    ring.style.width = `${70 * scale}px`;
-                    ring.style.height = `${70 * scale}px`;
+                    ring.style.width = `${50 * scale}px`;
+                    ring.style.height = `${50 * scale}px`;
                 }
             }
             
@@ -738,11 +780,11 @@ html_content = """
                 if(ring) {
                     const scale = 1 + (avg / 100);
                     ring.style.opacity = avg > 5 ? 0.8 : 0;
-                    ring.style.width = `${70 * scale}px`;
-                    ring.style.height = `${70 * scale}px`;
+                    ring.style.width = `${50 * scale}px`;
+                    ring.style.height = `${50 * scale}px`;
                 }
                 
-                // Broadcast volume for others to animate
+                // Broadcast volume
                 if(avg > 5) sendVc({type: "vc_talking", vol: avg});
             }, 100);
         }
@@ -759,14 +801,16 @@ html_content = """
                     <img class="vc-avatar" src="${pfp}">
                     <div class="vc-mic-status" id="mic-${uid}" style="display:none;">✕</div>
                 </div>
-                <div style="font-size:0.8rem;">${name}</div>
+                <div style="font-size:0.75rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; width:60px; text-align:center;">${name}</div>
             `;
             grid.appendChild(div);
         }
 
         function playStream(aud, s) {
             aud.srcObject = s;
-            aud.addEventListener('loadedmetadata', () => aud.play());
+            aud.addEventListener('loadedmetadata', () => {
+                aud.play().catch(e => console.log("Auto-play blocked", e));
+            });
             document.getElementById('audio-container').appendChild(aud);
         }
 
@@ -776,7 +820,6 @@ html_content = """
             document.getElementById('mute-btn').style.background = isMuted ? '#fff' : '#27272a';
             document.getElementById('mute-btn').style.color = isMuted ? '#000' : '#fff';
             
-            // UI
             document.getElementById(`mic-${state.uid}`).style.display = isMuted ? 'flex' : 'none';
             sendVc({type: "vc_update", muted: isMuted});
         }
@@ -787,9 +830,49 @@ html_content = """
             if(micLoop) clearInterval(micLoop);
             if(audioCtx) audioCtx.close();
             
-            document.getElementById('vc-modal').style.display = 'none';
+            document.getElementById('vc-widget').style.display = 'none';
             document.getElementById('vc-grid').innerHTML = '';
             document.getElementById('audio-container').innerHTML = '';
+        }
+
+        // --- FLOATING WIDGET LOGIC ---
+        
+        function toggleVcSize() {
+            const w = document.getElementById('vc-widget');
+            w.classList.toggle('minimized');
+        }
+
+        function dragElement(elmnt) {
+            var pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+            if (document.getElementById("vc-header")) {
+                document.getElementById("vc-header").onmousedown = dragMouseDown;
+            } 
+
+            function dragMouseDown(e) {
+                e = e || window.event;
+                e.preventDefault();
+                pos3 = e.clientX;
+                pos4 = e.clientY;
+                document.onmouseup = closeDragElement;
+                document.onmousemove = elementDrag;
+            }
+
+            function elementDrag(e) {
+                e = e || window.event;
+                e.preventDefault();
+                pos1 = pos3 - e.clientX;
+                pos2 = pos4 - e.clientY;
+                pos3 = e.clientX;
+                pos4 = e.clientY;
+                elmnt.style.top = (elmnt.offsetTop - pos2) + "px";
+                elmnt.style.left = (elmnt.offsetLeft - pos1) + "px";
+                elmnt.style.right = "auto"; 
+            }
+
+            function closeDragElement() {
+                document.onmouseup = null;
+                document.onmousemove = null;
+            }
         }
 
     </script>
