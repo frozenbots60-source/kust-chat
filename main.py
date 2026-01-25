@@ -3,22 +3,21 @@ import json
 import asyncio
 import boto3
 from typing import List, Dict, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from redis import asyncio as aioredis
-from botocore.exceptions import NoCredentialsError
 
-app = FastAPI(title="Kustify API", description="Telegram-like Chat with Voice & Groups", version="3.0")
+app = FastAPI(title="Kustify Ultra", description="Premium Animated Chat", version="4.0")
 
 # --- CONFIGURATION ---
 
-# 1. Redis Configuration (Upstash)
+# 1. Redis Configuration
 REDIS_URL = os.getenv("UPSTASH_REDIS_URL") or os.getenv("UPSTASH_REDIS_REST_URL")
 if not REDIS_URL:
-    print("WARNING: REDIS_URL not set. App will fail to connect to DB.")
+    print("CRITICAL: REDIS_URL is missing.")
 
-# 2. AWS S3 Configuration (Bucketeer)
+# 2. AWS S3 Configuration
 AWS_ACCESS_KEY = os.getenv("BUCKETEER_AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("BUCKETEER_AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("BUCKETEER_AWS_REGION")
@@ -26,10 +25,8 @@ BUCKET_NAME = os.getenv("BUCKETEER_BUCKET_NAME")
 
 # --- INITIALIZATION ---
 
-# Redis Client
 redis = aioredis.from_url(REDIS_URL, decode_responses=True)
 
-# S3 Client
 s3_client = boto3.client(
     's3',
     aws_access_key_id=AWS_ACCESS_KEY,
@@ -37,29 +34,18 @@ s3_client = boto3.client(
     region_name=AWS_REGION
 )
 
-# Constants
-GLOBAL_CHANNEL = "kustify_global_events"
-GROUPS_KEY = "kustify:groups_list"
+GLOBAL_CHANNEL = "kustify_global_v4"
+GROUPS_KEY = "kustify:groups_v4"
 
-# --- PYDANTIC MODELS ---
+# --- MODELS ---
 
 class GroupCreate(BaseModel):
     name: str
 
-class Message(BaseModel):
-    id: str
-    group_id: str
-    user_id: str
-    user_name: str
-    text: Optional[str] = None
-    image_url: Optional[str] = None
-    timestamp: float
-
-# --- WEBSOCKET CONNECTION MANAGER ---
+# --- CONNECTION MANAGER ---
 
 class ConnectionManager:
     def __init__(self):
-        # connections stores: {group_id: [WebSocket, ...]}
         self.active_connections: Dict[str, List[WebSocket]] = {}
 
     async def connect(self, websocket: WebSocket, group_id: str):
@@ -73,18 +59,18 @@ class ConnectionManager:
             if websocket in self.active_connections[group_id]:
                 self.active_connections[group_id].remove(websocket)
 
-    async def broadcast_to_group(self, group_id: str, message: dict):
+    async def broadcast(self, group_id: str, message: dict):
         if group_id in self.active_connections:
-            text_data = json.dumps(message)
+            data = json.dumps(message)
             for connection in self.active_connections[group_id]:
                 try:
-                    await connection.send_text(text_data)
-                except Exception:
+                    await connection.send_text(data)
+                except:
                     pass
 
 manager = ConnectionManager()
 
-# --- REDIS LISTENER (BACKGROUND TASK) ---
+# --- BACKGROUND WORKER ---
 
 async def redis_listener():
     pubsub = redis.pubsub()
@@ -94,18 +80,15 @@ async def redis_listener():
             data = json.loads(message["data"])
             group_id = data.get("group_id")
             if group_id:
-                await manager.broadcast_to_group(group_id, data)
+                await manager.broadcast(group_id, data)
 
 @app.on_event("startup")
 async def startup_event():
-    # Ensure default group exists
-    exists = await redis.sismember(GROUPS_KEY, "General")
-    if not exists:
+    if not await redis.sismember(GROUPS_KEY, "General"):
         await redis.sadd(GROUPS_KEY, "General")
-    
     asyncio.create_task(redis_listener())
 
-# --- API ENDPOINTS ---
+# --- API ---
 
 @app.get("/api/groups")
 async def get_groups():
@@ -121,95 +104,65 @@ async def create_group(group: GroupCreate):
 async def get_history(group_id: str, limit: int = 50):
     key = f"kustify:history:{group_id}"
     messages = await redis.lrange(key, -limit, -1)
-    parsed = [json.loads(m) for m in messages]
-    return parsed
+    return [json.loads(m) for m in messages]
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """
-    FIXED: Removed ACL='public-read' to prevent 500 errors on private buckets.
-    Uses Presigned URLs for access.
-    """
     try:
-        file_key = f"kustify_uploads/{file.filename}"
-        
-        # Upload without ACL (safer for Bucketeer)
+        file_key = f"kustify_v4/{file.filename}"
         s3_client.upload_fileobj(
-            file.file,
-            BUCKET_NAME,
-            file_key,
+            file.file, BUCKET_NAME, file_key,
             ExtraArgs={'ContentType': file.content_type}
         )
-        
-        # Generate Presigned URL (valid for 7 days)
         url = s3_client.generate_presigned_url(
             'get_object',
             Params={'Bucket': BUCKET_NAME, 'Key': file_key},
-            ExpiresIn=604800 
+            ExpiresIn=604800
         )
         return {"url": url}
     except Exception as e:
-        print(f"Upload Error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# --- WEBSOCKET ENDPOINT ---
+# --- WEBSOCKET ---
 
 @app.websocket("/ws/{group_id}/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
     await manager.connect(websocket, group_id)
     try:
         while True:
-            data_str = await websocket.receive_text()
-            data = json.loads(data_str)
-            msg_type = data.get("type")
+            raw = await websocket.receive_text()
+            data = json.loads(raw)
+            mtype = data.get("type")
 
-            if msg_type == "heartbeat":
+            if mtype == "heartbeat":
                 await websocket.send_text(json.dumps({"type": "heartbeat_ack"}))
                 continue
 
-            elif msg_type == "message":
-                out_msg = {
+            elif mtype == "message":
+                out = {
                     "type": "message",
                     "group_id": group_id,
                     "user_id": user_id,
-                    "user_name": data.get("user_name", "Unknown"),
+                    "user_name": data.get("user_name"),
+                    "user_pfp": data.get("user_pfp"),
                     "text": data.get("text"),
                     "image_url": data.get("image_url"),
                     "timestamp": data.get("timestamp")
                 }
-                
-                # Save & Broadcast
-                history_key = f"kustify:history:{group_id}"
-                await redis.rpush(history_key, json.dumps(out_msg))
-                await redis.publish(GLOBAL_CHANNEL, json.dumps(out_msg))
+                # Save & Publish
+                await redis.rpush(f"kustify:history:{group_id}", json.dumps(out))
+                await redis.publish(GLOBAL_CHANNEL, json.dumps(out))
 
-            elif msg_type == "vc_signal":
-                # WebRTC Signal Routing
-                signal_payload = {
-                    "type": "vc_signal",
-                    "sender_id": user_id,
-                    "sender_name": data.get("sender_name"),
-                    "payload": data.get("payload"),
-                    "target_id": data.get("target_id")
-                }
-                await manager.broadcast_to_group(group_id, signal_payload)
-            
-            elif msg_type == "vc_update":
-                # For mic status updates (mute/unmute/speaking)
-                update_payload = {
-                    "type": "vc_update",
-                    "sender_id": user_id,
-                    "status": data.get("status") # e.g., { "muted": true }
-                }
-                await manager.broadcast_to_group(group_id, update_payload)
+            elif mtype in ["vc_signal", "vc_update", "vc_talking"]:
+                # Pass-through for WebRTC signaling and visualizer data
+                data["sender_id"] = user_id
+                await manager.broadcast(group_id, data)
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, group_id)
-        # Notify others user left VC/Chat
-        leave_msg = {"type": "user_left", "user_id": user_id}
-        await manager.broadcast_to_group(group_id, leave_msg)
+        await manager.broadcast(group_id, {"type": "user_left", "user_id": user_id})
 
-# --- FRONTEND (HTML/CSS/JS) ---
+# --- FRONTEND ---
 
 @app.get("/")
 async def get():
@@ -221,636 +174,624 @@ html_content = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Kustify | Premium Chat</title>
+    <title>Kustify Ultra</title>
     <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-dark: #0f172a;
-            --bg-panel: #1e293b;
-            --bg-input: #334155;
-            --primary: #3b82f6;
-            --primary-hover: #2563eb;
-            --text-main: #f1f5f9;
-            --text-muted: #94a3b8;
-            --border: #334155;
-            --msg-me: #3b82f6;
-            --msg-other: #1e293b;
-            --sidebar-width: 280px;
+            --bg-dark: #09090b;
+            --bg-glass: rgba(24, 24, 27, 0.7);
+            --bg-panel: #18181b;
+            --primary: #8b5cf6;
+            --primary-glow: rgba(139, 92, 246, 0.5);
+            --accent: #ec4899;
+            --text-main: #fafafa;
+            --text-muted: #a1a1aa;
+            --border: rgba(255, 255, 255, 0.1);
+            --msg-me: linear-gradient(135deg, #7c3aed, #db2777);
+            --msg-other: #27272a;
         }
 
-        * { box-sizing: border-box; margin: 0; padding: 0; scrollbar-width: thin; scrollbar-color: var(--bg-input) var(--bg-dark); }
+        * { margin: 0; padding: 0; box-sizing: border-box; outline: none; -webkit-tap-highlight-color: transparent; }
         
         body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background-color: var(--bg-dark);
+            font-family: 'Outfit', sans-serif;
+            background: var(--bg-dark);
+            background-image: radial-gradient(circle at 10% 20%, rgba(139, 92, 246, 0.15) 0%, transparent 20%),
+                              radial-gradient(circle at 90% 80%, rgba(236, 72, 153, 0.15) 0%, transparent 20%);
             color: var(--text-main);
             height: 100vh;
             display: flex;
             overflow: hidden;
         }
 
-        /* --- SIDEBAR & MOBILE NAV --- */
+        /* --- UI COMPONENTS --- */
+        
+        /* Sidebar */
         #sidebar {
-            width: var(--sidebar-width);
-            background-color: #111827;
+            width: 300px;
+            background: var(--bg-glass);
+            backdrop-filter: blur(20px);
             border-right: 1px solid var(--border);
-            display: flex;
-            flex-direction: column;
-            transition: transform 0.3s ease;
+            display: flex; flex-direction: column;
             z-index: 50;
+            transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
         }
 
         .brand {
-            padding: 20px;
-            font-size: 1.5rem;
-            font-weight: 800;
-            color: var(--primary);
+            padding: 25px; font-size: 1.8rem; font-weight: 800;
+            background: linear-gradient(to right, #fff, #a1a1aa);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
             border-bottom: 1px solid var(--border);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+            display: flex; justify-content: space-between; align-items: center;
         }
 
-        .close-sidebar { display: none; cursor: pointer; font-size: 1.2rem; }
+        .user-profile-widget {
+            padding: 15px; border-bottom: 1px solid var(--border);
+            display: flex; align-items: center; gap: 10px; cursor: pointer;
+            transition: 0.2s;
+        }
+        .user-profile-widget:hover { background: rgba(255,255,255,0.05); }
+        .my-pfp { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; border: 2px solid var(--primary); }
 
-        .group-list { flex: 1; overflow-y: auto; padding: 10px; }
+        .group-list { flex: 1; padding: 15px; overflow-y: auto; }
         .group-item {
-            padding: 12px 15px; margin-bottom: 5px; border-radius: 8px;
-            cursor: pointer; font-weight: 500; display: flex; align-items: center;
-            color: var(--text-muted);
+            padding: 14px 18px; margin-bottom: 8px; border-radius: 12px;
+            cursor: pointer; font-weight: 500; color: var(--text-muted);
+            transition: all 0.3s ease; position: relative; overflow: hidden;
         }
-        .group-item:hover { background-color: var(--bg-input); color: white; }
-        .group-item.active { background-color: var(--primary); color: white; }
-        .group-item::before { content: '#'; margin-right: 10px; opacity: 0.5; }
+        .group-item:hover { background: rgba(255,255,255,0.05); color: white; transform: translateX(5px); }
+        .group-item.active { background: rgba(139, 92, 246, 0.15); color: var(--primary); border: 1px solid var(--primary-glow); }
 
-        .create-group-btn {
-            margin: 10px; padding: 10px; background: var(--bg-input);
-            border: 1px dashed var(--text-muted); color: var(--text-muted);
-            border-radius: 8px; cursor: pointer; text-align: center;
+        .create-btn {
+            margin: 15px; padding: 12px; border-radius: 12px;
+            background: rgba(255,255,255,0.03); border: 1px dashed var(--border);
+            color: var(--text-muted); cursor: pointer; text-align: center;
+            transition: 0.2s;
         }
+        .create-btn:hover { border-color: var(--primary); color: var(--primary); background: rgba(139, 92, 246, 0.05); }
 
-        /* --- MAIN CHAT AREA --- */
+        /* Chat Area */
         #chat-area {
             flex: 1; display: flex; flex-direction: column;
-            background-color: var(--bg-dark); position: relative;
-            width: 100%;
+            position: relative; background: transparent;
         }
 
         #chat-header {
-            padding: 15px 20px; border-bottom: 1px solid var(--border);
-            background-color: rgba(15, 23, 42, 0.95);
+            padding: 15px 25px;
+            background: rgba(9, 9, 11, 0.8);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid var(--border);
             display: flex; justify-content: space-between; align-items: center;
-            backdrop-filter: blur(5px);
         }
-
-        .header-left { display: flex; align-items: center; gap: 10px; }
-        .menu-btn { 
-            display: none; background: none; border: none; color: white; 
-            font-size: 1.5rem; cursor: pointer; 
-        }
-        .header-title { font-weight: 700; font-size: 1.1rem; }
 
         .vc-btn {
-            padding: 8px 16px; border-radius: 20px; border: none;
-            font-weight: 600; cursor: pointer; background: #10b981; color: white;
-            display: flex; align-items: center; gap: 5px;
+            padding: 10px 20px; border-radius: 30px; border: none;
+            font-weight: 600; cursor: pointer;
+            background: linear-gradient(135deg, #10b981, #059669);
+            color: white; box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
+            transition: transform 0.2s;
+            display: flex; align-items: center; gap: 8px;
         }
+        .vc-btn:active { transform: scale(0.95); }
 
         #messages {
             flex: 1; overflow-y: auto; padding: 20px;
-            display: flex; flex-direction: column; gap: 12px;
+            display: flex; flex-direction: column; gap: 15px;
+            scroll-behavior: smooth;
         }
 
         .message {
-            max-width: 80%; padding: 10px 14px; border-radius: 12px;
-            position: relative; line-height: 1.5; font-size: 0.95rem;
-            animation: fadeIn 0.2s ease;
+            max-width: 75%; display: flex; gap: 12px;
+            animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
         }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes slideIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
 
-        .msg-own { align-self: flex-end; background-color: var(--msg-me); border-bottom-right-radius: 2px; }
-        .msg-other { align-self: flex-start; background-color: var(--msg-other); border-bottom-left-radius: 2px; }
-        .msg-meta { font-size: 0.75rem; opacity: 0.7; margin-bottom: 4px; display: block; font-weight: 600; }
+        .msg-content {
+            padding: 12px 18px; border-radius: 18px;
+            font-size: 0.95rem; line-height: 1.5;
+            position: relative; box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+        }
+        
+        .msg-own { align-self: flex-end; flex-direction: row-reverse; }
+        .msg-own .msg-content { background: var(--msg-me); color: white; border-bottom-right-radius: 4px; }
+        
+        .msg-other { align-self: flex-start; }
+        .msg-other .msg-content { background: var(--msg-other); border-bottom-left-radius: 4px; }
 
-        /* Image Loading */
-        .img-container {
-            position: relative; min-width: 150px; min-height: 150px;
-            background: rgba(0,0,0,0.2); border-radius: 8px; margin-top: 8px;
-            display: flex; align-items: center; justify-content: center; overflow: hidden;
+        .msg-avatar {
+            width: 35px; height: 35px; border-radius: 50%; object-fit: cover;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
         }
-        .msg-img { max-width: 100%; display: none; border-radius: 8px; cursor: pointer; }
-        .loading-spinner {
-            border: 3px solid rgba(255,255,255,0.3); border-radius: 50%;
-            border-top: 3px solid white; width: 24px; height: 24px;
-            animation: spin 1s linear infinite; position: absolute;
-        }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+        .msg-meta { font-size: 0.75rem; margin-bottom: 4px; opacity: 0.8; font-weight: 600; }
+        .msg-img { max-width: 100%; border-radius: 12px; margin-top: 10px; cursor: pointer; transition: transform 0.2s; }
+        .msg-img:hover { transform: scale(1.02); }
 
         #input-area {
-            padding: 15px; background-color: var(--bg-dark);
-            display: flex; gap: 10px; align-items: center; border-top: 1px solid var(--border);
+            padding: 20px; background: rgba(9, 9, 11, 0.9);
+            backdrop-filter: blur(10px);
+            border-top: 1px solid var(--border);
+            display: flex; gap: 12px; align-items: center;
         }
-        .attach-btn {
-            width: 40px; height: 40px; border-radius: 50%; border: none;
-            background: var(--bg-input); color: var(--text-muted); cursor: pointer;
-            font-size: 1.2rem;
-        }
+
         #msg-input {
-            flex: 1; background-color: var(--bg-input); border: none;
-            padding: 12px 20px; border-radius: 24px; color: white;
-            font-size: 1rem; outline: none;
+            flex: 1; background: var(--bg-panel); border: 1px solid var(--border);
+            padding: 14px 24px; border-radius: 30px; color: white;
+            font-size: 1rem; transition: 0.2s;
         }
-        .send-btn {
-            background-color: var(--primary); color: white; border: none;
-            width: 45px; height: 45px; border-radius: 50%; cursor: pointer;
+        #msg-input:focus { border-color: var(--primary); box-shadow: 0 0 15px rgba(139, 92, 246, 0.2); }
+
+        .icon-btn {
+            width: 48px; height: 48px; border-radius: 50%; border: none;
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer; font-size: 1.2rem; transition: 0.2s;
+        }
+        .attach-btn { background: rgba(255,255,255,0.05); color: var(--text-muted); }
+        .attach-btn:hover { background: rgba(255,255,255,0.1); color: white; }
+        .send-btn { background: var(--primary); color: white; box-shadow: 0 4px 15px var(--primary-glow); }
+        .send-btn:hover { transform: scale(1.05); }
+
+        /* --- MODALS --- */
+        .modal-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.8); backdrop-filter: blur(8px);
+            z-index: 100; display: none; justify-content: center; align-items: center;
+            animation: fadeIn 0.3s ease;
+        }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+        .modal-box {
+            background: #18181b; width: 90%; max-width: 420px;
+            padding: 30px; border-radius: 24px; border: 1px solid var(--border);
+            box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+            text-align: center;
+            animation: scaleUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        @keyframes scaleUp { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+        .modal-box input {
+            width: 100%; padding: 14px; margin: 20px 0; background: #09090b;
+            border: 1px solid var(--border); border-radius: 12px; color: white;
+        }
+        .modal-box button {
+            width: 100%; padding: 14px; background: var(--primary); border: none;
+            border-radius: 12px; color: white; font-weight: bold; cursor: pointer;
         }
 
-        /* --- VC MODAL (Telegram Style) --- */
-        #vc-modal {
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0,0,0,0.85); z-index: 100; display: none;
-            flex-direction: column; align-items: center; justify-content: center;
-        }
-        .vc-window {
-            background: var(--bg-panel); width: 90%; max-width: 400px;
-            border-radius: 20px; padding: 20px; box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-            display: flex; flex-direction: column; gap: 20px;
-        }
-        .vc-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
-        .vc-title { font-weight: bold; font-size: 1.2rem; }
+        /* --- VOICE CHAT --- */
         .vc-grid {
-            display: grid; grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
-            gap: 15px; max-height: 300px; overflow-y: auto; padding: 10px 0;
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+            gap: 20px; margin: 20px 0; max-height: 400px; overflow-y: auto;
         }
+        
         .vc-user {
-            display: flex; flex-direction: column; align-items: center; gap: 5px;
-            position: relative;
+            display: flex; flex-direction: column; align-items: center; gap: 8px;
         }
-        .vc-avatar {
-            width: 60px; height: 60px; border-radius: 50%; background: linear-gradient(135deg, #6366f1, #a855f7);
-            display: flex; align-items: center; justify-content: center; font-size: 1.5rem; font-weight: bold;
-            border: 3px solid transparent; transition: border-color 0.2s;
-        }
-        .vc-avatar.speaking { border-color: #10b981; box-shadow: 0 0 15px rgba(16, 185, 129, 0.4); }
-        .vc-avatar.muted { filter: grayscale(100%); opacity: 0.6; }
-        .vc-name { font-size: 0.8rem; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
-        .vc-mic-icon {
-            position: absolute; bottom: 20px; right: 5px; background: #ef4444;
-            width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
-            font-size: 0.7rem; border: 2px solid var(--bg-panel);
-        }
-        .vc-controls-row { display: flex; justify-content: center; gap: 20px; margin-top: 10px; }
-        .vc-circle-btn {
-            width: 50px; height: 50px; border-radius: 50%; border: none;
-            display: flex; align-items: center; justify-content: center; font-size: 1.2rem; cursor: pointer;
-        }
-        .btn-mute { background: var(--bg-input); color: white; }
-        .btn-mute.active { background: white; color: black; }
-        .btn-end { background: #ef4444; color: white; }
-
-        /* --- LOGIN MODAL --- */
-        #login-modal {
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0,0,0,0.9); z-index: 200;
+        
+        .vc-avatar-container {
+            position: relative; width: 80px; height: 80px;
             display: flex; justify-content: center; align-items: center;
         }
-        .modal-content {
-            background: var(--bg-panel); padding: 30px; border-radius: 16px;
-            width: 300px; text-align: center;
-        }
-        .modal-content input {
-            width: 100%; padding: 12px; margin: 15px 0; border-radius: 8px;
-            border: 1px solid var(--border); background: var(--bg-dark); color: white; outline: none;
-        }
-        .modal-content button {
-            width: 100%; padding: 12px; background: var(--primary);
-            border: none; color: white; border-radius: 8px; font-weight: bold; cursor: pointer;
+        
+        .vc-avatar {
+            width: 70px; height: 70px; border-radius: 50%; object-fit: cover;
+            z-index: 2; border: 3px solid #27272a;
         }
 
-        /* --- RESPONSIVE CSS --- */
+        /* The Visualizer Ring */
+        .vc-ring {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            width: 70px; height: 70px; border-radius: 50%;
+            background: var(--primary); opacity: 0; z-index: 1;
+            transition: width 0.05s, height 0.05s, opacity 0.1s;
+        }
+
+        .vc-mic-status {
+            position: absolute; bottom: 0; right: 0; width: 24px; height: 24px;
+            background: #ef4444; border-radius: 50%; border: 3px solid #18181b;
+            display: flex; align-items: center; justify-content: center; font-size: 10px;
+            z-index: 3;
+        }
+
+        /* --- MOBILE --- */
         @media (max-width: 768px) {
-            #sidebar {
-                position: absolute; height: 100%; transform: translateX(-100%);
-                box-shadow: 5px 0 15px rgba(0,0,0,0.5);
-            }
+            #sidebar { position: fixed; height: 100%; transform: translateX(-100%); width: 80%; }
             #sidebar.open { transform: translateX(0); }
-            .menu-btn { display: block; }
-            .close-sidebar { display: block; }
+            .menu-btn { display: block; background: none; border: none; color: white; font-size: 1.5rem; margin-right: 15px; }
             .message { max-width: 90%; }
         }
+        @media (min-width: 769px) { .menu-btn { display: none; } }
+
     </style>
 </head>
 <body>
 
-    <div id="login-modal">
-        <div class="modal-content">
-            <h2>Kustify</h2>
-            <p style="color:var(--text-muted); margin-top:5px;">Enter your name</p>
-            <input type="text" id="username-input" placeholder="Your Name">
-            <button onclick="login()">Start Messaging</button>
+    <div id="setup-modal" class="modal-overlay" style="display: flex;">
+        <div class="modal-box">
+            <h2 style="font-weight: 800; font-size: 2rem; margin-bottom: 5px;">Kustify</h2>
+            <p style="color: var(--text-muted);">Set up your profile</p>
+            
+            <div style="margin: 20px auto; width: 100px; height: 100px; position: relative;">
+                <img id="preview-pfp" src="https://ui-avatars.com/api/?background=random" style="width: 100%; height: 100%; border-radius: 50%; object-fit: cover;">
+                <label for="pfp-upload" style="position: absolute; bottom: 0; right: 0; background: var(--primary); width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer;">📷</label>
+                <input type="file" id="pfp-upload" style="display: none;" onchange="uploadPfp()">
+            </div>
+
+            <input type="text" id="username-input" placeholder="Display Name">
+            <button onclick="saveProfile()">Enter Kustify</button>
         </div>
     </div>
 
-    <div id="vc-modal">
-        <div class="vc-window">
-            <div class="vc-header">
-                <span class="vc-title">Voice Chat</span>
-                <span style="color:#10b981; font-size:0.8rem;">● Live</span>
+    <div id="vc-modal" class="modal-overlay">
+        <div class="modal-box" style="max-width: 600px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h3>Voice Chat</h3>
+                <span style="background: #064e3b; color: #34d399; padding: 4px 10px; border-radius: 20px; font-size: 0.8rem;">● Live</span>
             </div>
-            <div class="vc-grid" id="vc-grid">
-                </div>
-            <div class="vc-controls-row">
-                <button class="vc-circle-btn btn-mute" id="mute-btn" onclick="toggleMute()">🎤</button>
-                <button class="vc-circle-btn btn-end" onclick="leaveVoice()">❌</button>
+            
+            <div class="vc-grid" id="vc-grid"></div>
+            
+            <div style="display: flex; justify-content: center; gap: 15px; margin-top: 20px;">
+                <button onclick="toggleMute()" id="mute-btn" style="width: 50px; background: #27272a;">🎤</button>
+                <button onclick="leaveVoice()" style="width: 50px; background: #ef4444;">❌</button>
             </div>
         </div>
     </div>
 
     <div id="sidebar">
-        <div class="brand">
-            Kustify
-            <span class="close-sidebar" onclick="toggleSidebar()">✕</span>
+        <div class="brand">Kustify <span style="font-size: 1rem; cursor: pointer;" onclick="toggleSidebar()">✕</span></div>
+        <div class="user-profile-widget">
+            <img id="side-pfp" class="my-pfp" src="">
+            <div>
+                <div id="side-name" style="font-weight: bold;"></div>
+                <div style="font-size: 0.8rem; color: var(--text-muted);">Online</div>
+            </div>
         </div>
         <div class="group-list" id="group-list"></div>
-        <div class="create-group-btn" onclick="createNewGroup()">+ New Group</div>
+        <div class="create-btn" onclick="createGroup()">+ Create New Room</div>
     </div>
 
     <div id="chat-area">
         <div id="chat-header">
-            <div class="header-left">
+            <div style="display: flex; align-items: center;">
                 <button class="menu-btn" onclick="toggleSidebar()">☰</button>
-                <div class="header-title" id="current-group-name"># General</div>
+                <h3 id="header-title"># General</h3>
             </div>
-            <button class="vc-btn" onclick="joinVoice()">🎤 Join VC</button>
+            <button class="vc-btn" onclick="joinVoice()">
+                <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
+                Join Voice
+            </button>
         </div>
 
         <div id="messages"></div>
 
         <div id="input-area">
-            <button class="attach-btn" onclick="document.getElementById('file-input').click()">📎</button>
-            <input type="file" id="file-input" style="display: none;" onchange="handleFileUpload()">
-            <input type="text" id="msg-input" placeholder="Message..." autocomplete="off">
-            <button class="send-btn" onclick="sendMessage()">➤</button>
+            <button class="icon-btn attach-btn" onclick="document.getElementById('file-input').click()">+</button>
+            <input type="file" id="file-input" hidden onchange="handleFile()">
+            <input type="text" id="msg-input" placeholder="Type a message..." autocomplete="off">
+            <button class="icon-btn send-btn" onclick="sendMessage()">➤</button>
         </div>
     </div>
 
-    <div id="audio-container" style="display:none;"></div>
+    <div id="audio-container" hidden></div>
 
     <script>
-        // GLOBALS
-        let currentUser = localStorage.getItem("kust_username");
-        let userId = localStorage.getItem("kust_userid") || "user_" + Math.random().toString(36).substr(2, 9);
-        localStorage.setItem("kust_userid", userId);
+        // --- STATE ---
+        const state = {
+            user: localStorage.getItem("k_user") || "",
+            uid: localStorage.getItem("k_uid") || "u_" + Math.random().toString(36).substr(2),
+            pfp: localStorage.getItem("k_pfp") || `https://ui-avatars.com/api/?background=random&name=User`,
+            group: "General",
+            ws: null,
+            hb: null
+        };
+        localStorage.setItem("k_uid", state.uid);
 
-        let currentGroup = "General";
-        let ws = null;
-        let heartbeatInt = null;
-        
-        // Voice Globals
+        // --- VC STATE ---
         let peer = null;
         let myStream = null;
-        let peers = {}; 
+        let audioCtx = null;
+        let analyser = null;
+        let dataArray = null;
+        let micLoop = null;
         let isMuted = false;
-        let vcUsers = new Set(); // store userIds in VC
 
         // --- INIT ---
         window.onload = () => {
-            if (currentUser) {
-                document.getElementById('login-modal').style.display = 'none';
+            if(state.user) {
+                document.getElementById('setup-modal').style.display = 'none';
+                updateProfileUI();
                 initApp();
             } else {
-                document.getElementById('username-input').focus();
+                document.getElementById('preview-pfp').src = state.pfp;
             }
         };
 
-        function login() {
-            const input = document.getElementById('username-input');
-            const val = input.value.trim();
-            if (!val) return;
-            
-            currentUser = val;
-            localStorage.setItem("kust_username", val);
-            document.getElementById('login-modal').style.display = 'none';
+        async function uploadPfp() {
+            const file = document.getElementById('pfp-upload').files[0];
+            if(!file) return;
+            const form = new FormData(); form.append('file', file);
+            try {
+                const res = await fetch('/api/upload', {method: 'POST', body: form});
+                const data = await res.json();
+                state.pfp = data.url;
+                document.getElementById('preview-pfp').src = state.pfp;
+            } catch(e) { alert("Upload failed"); }
+        }
+
+        function saveProfile() {
+            const name = document.getElementById('username-input').value.trim();
+            if(!name) return;
+            state.user = name;
+            localStorage.setItem("k_user", state.user);
+            localStorage.setItem("k_pfp", state.pfp);
+            document.getElementById('setup-modal').style.display = 'none';
+            updateProfileUI();
             initApp();
         }
 
-        async function initApp() {
-            await loadGroups();
-            connectToGroup("General");
+        function updateProfileUI() {
+            document.getElementById('side-pfp').src = state.pfp;
+            document.getElementById('side-name').innerText = state.user;
         }
 
-        function toggleSidebar() {
-            document.getElementById('sidebar').classList.toggle('open');
+        function toggleSidebar() { document.getElementById('sidebar').classList.toggle('open'); }
+
+        async function initApp() {
+            loadGroups();
+            connect(state.group);
         }
 
         async function loadGroups() {
-            try {
-                const res = await fetch('/api/groups');
-                const data = await res.json();
-                const list = document.getElementById('group-list');
-                list.innerHTML = '';
-                data.groups.forEach(g => {
-                    const div = document.createElement('div');
-                    div.className = `group-item ${g === currentGroup ? 'active' : ''}`;
-                    div.innerText = g;
-                    div.onclick = () => {
-                        connectToGroup(g);
-                        if(window.innerWidth < 768) toggleSidebar();
-                    };
-                    list.appendChild(div);
-                });
-            } catch(e) { console.error(e); }
+            const res = await fetch('/api/groups');
+            const data = await res.json();
+            const list = document.getElementById('group-list');
+            list.innerHTML = '';
+            data.groups.forEach(g => {
+                const div = document.createElement('div');
+                div.className = `group-item ${g === state.group ? 'active' : ''}`;
+                div.innerText = `# ${g}`;
+                div.onclick = () => {
+                    if(window.innerWidth < 768) toggleSidebar();
+                    connect(g);
+                };
+                list.appendChild(div);
+            });
         }
 
-        async function createNewGroup() {
+        async function createGroup() {
             const name = prompt("Group Name:");
-            if (name) {
-                await fetch('/api/groups', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({name: name})
-                });
+            if(name) {
+                await fetch('/api/groups', {method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
                 loadGroups();
             }
         }
 
-        // --- CHAT LOGIC ---
+        // --- CHAT ---
+        function connect(group) {
+            if(state.ws) state.ws.close();
+            if(state.hb) clearInterval(state.hb);
+            leaveVoice();
 
-        function connectToGroup(groupName) {
-            if (ws) ws.close();
-            if (heartbeatInt) clearInterval(heartbeatInt);
-            leaveVoice(); // Auto leave VC on switch
+            state.group = group;
+            document.getElementById('header-title').innerText = `# ${group}`;
+            loadGroups();
+            document.getElementById('messages').innerHTML = '';
 
-            currentGroup = groupName;
-            document.getElementById('current-group-name').innerText = "# " + groupName;
-            loadGroups(); // Update active class
-            
-            const list = document.getElementById('messages');
-            list.innerHTML = '';
+            fetch(`/api/history/${group}`).then(r=>r.json()).then(msgs => msgs.forEach(renderMsg));
 
-            // Load History
-            fetch(`/api/history/${groupName}`)
-                .then(r => r.json())
-                .then(msgs => msgs.forEach(displayMessage));
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            state.ws = new WebSocket(`${proto}://${location.host}/ws/${group}/${state.uid}`);
 
-            // WebSocket
-            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-            ws = new WebSocket(`${proto}://${window.location.host}/ws/${groupName}/${userId}`);
-
-            ws.onopen = () => {
-                heartbeatInt = setInterval(() => ws.send(JSON.stringify({type: "heartbeat"})), 30000);
+            state.ws.onopen = () => {
+                state.hb = setInterval(() => state.ws.send(JSON.stringify({type: "heartbeat"})), 30000);
             };
 
-            ws.onmessage = (e) => {
-                const data = JSON.parse(e.data);
-                if (data.type === "heartbeat_ack") return;
-                if (data.type === "message") displayMessage(data);
-                if (data.type === "vc_signal") handleVcSignal(data);
-                if (data.type === "vc_update") handleVcUpdate(data);
-                if (data.type === "user_left") removeVcUser(data.user_id);
+            state.ws.onmessage = (e) => {
+                const d = JSON.parse(e.data);
+                if(d.type === "message") renderMsg(d);
+                if(d.type.startsWith("vc_")) handleVcEvent(d);
             };
         }
 
-        function displayMessage(data) {
-            const container = document.getElementById('messages');
+        function renderMsg(d) {
+            const box = document.getElementById('messages');
+            const isMe = d.user_id === state.uid;
             const div = document.createElement('div');
-            const isMe = data.user_id === userId;
-            
             div.className = `message ${isMe ? 'msg-own' : 'msg-other'}`;
             
-            let content = `<span class="msg-meta">${data.user_name}</span>`;
-            if (data.text) content += `<div>${data.text}</div>`;
-            
-            if (data.image_url) {
-                // Image with loading state
-                content += `
-                <div class="img-container">
-                    <div class="loading-spinner"></div>
-                    <img src="${data.image_url}" class="msg-img" onload="this.style.display='block'; this.previousElementSibling.style.display='none';" onclick="window.open(this.src)">
-                </div>`;
-            }
-            
-            div.innerHTML = content;
-            container.appendChild(div);
-            container.scrollTop = container.scrollHeight;
+            let html = `
+                <img class="msg-avatar" src="${d.user_pfp || 'https://ui-avatars.com/api/?name=?'}" >
+                <div class="msg-content">
+                    <div class="msg-meta">${d.user_name}</div>
+                    ${d.text ? `<div>${d.text}</div>` : ''}
+                    ${d.image_url ? `<img src="${d.image_url}" class="msg-img" onclick="window.open(this.src)">` : ''}
+                </div>
+            `;
+            div.innerHTML = html;
+            box.appendChild(div);
+            box.scrollTop = box.scrollHeight;
         }
 
         function sendMessage() {
-            const input = document.getElementById('msg-input');
-            const text = input.value.trim();
-            if (!text) return;
-
-            ws.send(JSON.stringify({
+            const inp = document.getElementById('msg-input');
+            const txt = inp.value.trim();
+            if(!txt) return;
+            state.ws.send(JSON.stringify({
                 type: "message",
-                user_name: currentUser,
-                text: text,
+                user_name: state.user,
+                user_pfp: state.pfp,
+                text: txt,
                 timestamp: Date.now()
             }));
-            input.value = '';
+            inp.value = '';
         }
 
-        document.getElementById('msg-input').addEventListener('keypress', (e) => { if(e.key==='Enter') sendMessage(); });
+        document.getElementById('msg-input').addEventListener('keypress', e => { if(e.key==='Enter') sendMessage(); });
 
-        async function handleFileUpload() {
-            const input = document.getElementById('file-input');
-            if (!input.files.length) return;
-            const file = input.files[0];
-            const formData = new FormData();
-            formData.append('file', file);
-
-            const status = document.getElementById('msg-input');
-            const oldPlace = status.placeholder;
-            status.placeholder = "Uploading...";
-            status.disabled = true;
-
+        async function handleFile() {
+            const file = document.getElementById('file-input').files[0];
+            if(!file) return;
+            const form = new FormData(); form.append('file', file);
+            
+            const btn = document.querySelector('.attach-btn');
+            const old = btn.innerHTML; btn.innerHTML = '...';
+            
             try {
-                const res = await fetch('/api/upload', {method: 'POST', body: formData});
-                if(!res.ok) throw new Error("Upload Error");
-                const data = await res.json();
-                
-                ws.send(JSON.stringify({
+                const res = await fetch('/api/upload', {method: 'POST', body: form});
+                const d = await res.json();
+                state.ws.send(JSON.stringify({
                     type: "message",
-                    user_name: currentUser,
+                    user_name: state.user,
+                    user_pfp: state.pfp,
                     text: "",
-                    image_url: data.url,
+                    image_url: d.url,
                     timestamp: Date.now()
                 }));
-            } catch (e) {
-                alert("Upload Failed. Check connection.");
-            } finally {
-                input.value = '';
-                status.placeholder = oldPlace;
-                status.disabled = false;
-                status.focus();
-            }
+            } catch(e) { alert("Err"); } 
+            finally { btn.innerHTML = old; document.getElementById('file-input').value = ''; }
         }
 
-        // --- VOICE CHAT LOGIC ---
-
+        // --- VC (VISUALIZER & LOGIC) ---
+        
         function joinVoice() {
-            navigator.mediaDevices.getUserMedia({ audio: true, video: false })
-                .then(stream => {
-                    myStream = stream;
-                    isMuted = false;
-                    
-                    document.getElementById('vc-modal').style.display = 'flex';
-                    
-                    // Add Self to Grid
-                    addVcUser(userId, currentUser, true);
+            navigator.mediaDevices.getUserMedia({audio: true}).then(stream => {
+                myStream = stream;
+                isMuted = false;
+                document.getElementById('vc-modal').style.display = 'flex';
+                
+                // Add Self
+                addVcUser(state.uid, state.user, state.pfp);
+                
+                // Audio Context for Visualizer
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const src = audioCtx.createMediaStreamSource(stream);
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 64;
+                src.connect(analyser);
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+                
+                startVisualizerLoop();
 
-                    peer = new Peer(userId);
-                    
-                    peer.on('open', (id) => {
-                        // Broadcast Join
-                        ws.send(JSON.stringify({
-                            type: "vc_signal",
-                            sender_name: currentUser,
-                            payload: { event: "join-request" },
-                            target_id: null
-                        }));
-                    });
-
-                    peer.on('call', (call) => {
-                        call.answer(stream);
-                        const audio = document.createElement('audio');
-                        call.on('stream', userStream => {
-                            addAudioStream(audio, userStream);
-                            // Ensure user exists in grid
-                            if(!vcUsers.has(call.peer)) addVcUser(call.peer, "User", false); 
-                        });
-                        peers[call.peer] = call;
-                    });
-                })
-                .catch(e => alert("Mic Access Denied: " + e));
+                // PeerJS
+                peer = new Peer(state.uid);
+                peer.on('open', () => {
+                    sendVc({type: "vc_signal", payload: {event: "join"}});
+                });
+                
+                peer.on('call', call => {
+                    call.answer(stream);
+                    const aud = document.createElement('audio');
+                    call.on('stream', s => playStream(aud, s));
+                });
+            }).catch(e => alert("Mic blocked"));
         }
 
-        function handleVcSignal(data) {
-            if (!peer || !myStream) return;
-            const senderId = data.sender_id;
-            if (senderId === userId) return;
-
-            const payload = data.payload;
-
-            if (payload.event === "join-request") {
-                // New user joined, add to UI & call them
-                addVcUser(senderId, data.sender_name, false);
-                
-                // Call them
-                const call = peer.call(senderId, myStream);
-                const audio = document.createElement('audio');
-                call.on('stream', us => addAudioStream(audio, us));
-                peers[senderId] = call;
-                
-                // Tell them I am here too (so they can add me to their UI)
-                ws.send(JSON.stringify({
-                    type: "vc_signal",
-                    sender_name: currentUser,
-                    target_id: senderId,
-                    payload: { event: "ack-presence" }
-                }));
-            } 
-            else if (payload.event === "ack-presence") {
-                // Existing user acknowledging my join
-                addVcUser(senderId, data.sender_name, false);
-            }
+        function sendVc(data) {
+            state.ws.send(JSON.stringify({...data, sender_name: state.user, sender_pfp: state.pfp}));
         }
 
-        function handleVcUpdate(data) {
-            if(!vcUsers.has(data.sender_id)) return;
-            const ui = document.getElementById(`vc-u-${data.sender_id}`);
-            if(ui) {
-                const avatar = ui.querySelector('.vc-avatar');
-                const micIcon = ui.querySelector('.vc-mic-icon');
-                if(data.status.muted) {
-                    avatar.classList.add('muted');
-                    micIcon.style.display = 'flex';
-                } else {
-                    avatar.classList.remove('muted');
-                    micIcon.style.display = 'none';
+        function handleVcEvent(d) {
+            if(d.sender_id === state.uid) return;
+            
+            if(d.type === "vc_signal") {
+                if(d.payload.event === "join") {
+                    addVcUser(d.sender_id, d.sender_name, d.sender_pfp);
+                    const call = peer.call(d.sender_id, myStream);
+                    const aud = document.createElement('audio');
+                    call.on('stream', s => playStream(aud, s));
+                    sendVc({type: "vc_signal", payload: {event: "ack"}, target_id: d.sender_id});
+                }
+                if(d.payload.event === "ack") {
+                    addVcUser(d.sender_id, d.sender_name, d.sender_pfp);
                 }
             }
+            
+            if(d.type === "vc_talking") {
+                // Animate other user's ring based on volume
+                const ring = document.getElementById(`ring-${d.sender_id}`);
+                if(ring) {
+                    const scale = 1 + (d.vol / 100);
+                    ring.style.opacity = d.vol > 5 ? 0.8 : 0;
+                    ring.style.width = `${70 * scale}px`;
+                    ring.style.height = `${70 * scale}px`;
+                }
+            }
+            
+            if(d.type === "vc_update") {
+                const el = document.getElementById(`mic-${d.sender_id}`);
+                if(el) el.style.display = d.muted ? 'flex' : 'none';
+            }
         }
 
-        function addVcUser(uid, name, isSelf) {
-            if (vcUsers.has(uid)) return;
-            vcUsers.add(uid);
-            
+        function startVisualizerLoop() {
+            micLoop = setInterval(() => {
+                if(!analyser || isMuted) return;
+                analyser.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for(let i=0; i<dataArray.length; i++) sum += dataArray[i];
+                const avg = sum / dataArray.length;
+                
+                // Animate self
+                const ring = document.getElementById(`ring-${state.uid}`);
+                if(ring) {
+                    const scale = 1 + (avg / 100);
+                    ring.style.opacity = avg > 5 ? 0.8 : 0;
+                    ring.style.width = `${70 * scale}px`;
+                    ring.style.height = `${70 * scale}px`;
+                }
+                
+                // Broadcast volume for others to animate
+                if(avg > 5) sendVc({type: "vc_talking", vol: avg});
+            }, 100);
+        }
+
+        function addVcUser(uid, name, pfp) {
+            if(document.getElementById(`vc-u-${uid}`)) return;
             const grid = document.getElementById('vc-grid');
-            const el = document.createElement('div');
-            el.className = 'vc-user';
-            el.id = `vc-u-${uid}`;
-            el.innerHTML = `
-                <div class="vc-avatar">
-                    ${name.charAt(0).toUpperCase()}
+            const div = document.createElement('div');
+            div.className = 'vc-user';
+            div.id = `vc-u-${uid}`;
+            div.innerHTML = `
+                <div class="vc-avatar-container">
+                    <div class="vc-ring" id="ring-${uid}"></div>
+                    <img class="vc-avatar" src="${pfp}">
+                    <div class="vc-mic-status" id="mic-${uid}" style="display:none;">✕</div>
                 </div>
-                <div class="vc-mic-icon" style="display:none;">✕</div>
-                <div class="vc-name">${name}</div>
+                <div style="font-size:0.8rem;">${name}</div>
             `;
-            grid.appendChild(el);
-            
-            // Audio visualizer simulation
-            if (!isSelf) {
-                setInterval(() => {
-                    const avatar = el.querySelector('.vc-avatar');
-                    // Randomly glow to simulate talking if not muted
-                    if (!avatar.classList.contains('muted') && Math.random() > 0.7) {
-                        avatar.classList.add('speaking');
-                        setTimeout(() => avatar.classList.remove('speaking'), 200);
-                    }
-                }, 500);
-            }
+            grid.appendChild(div);
         }
 
-        function removeVcUser(uid) {
-            if(vcUsers.has(uid)) {
-                vcUsers.delete(uid);
-                const el = document.getElementById(`vc-u-${uid}`);
-                if(el) el.remove();
-            }
-        }
-
-        function addAudioStream(audio, stream) {
-            audio.srcObject = stream;
-            audio.addEventListener('loadedmetadata', () => audio.play());
-            document.getElementById('audio-container').appendChild(audio);
+        function playStream(aud, s) {
+            aud.srcObject = s;
+            aud.addEventListener('loadedmetadata', () => aud.play());
+            document.getElementById('audio-container').appendChild(aud);
         }
 
         function toggleMute() {
-            if(!myStream) return;
             isMuted = !isMuted;
             myStream.getAudioTracks()[0].enabled = !isMuted;
+            document.getElementById('mute-btn').style.background = isMuted ? '#fff' : '#27272a';
+            document.getElementById('mute-btn').style.color = isMuted ? '#000' : '#fff';
             
-            const btn = document.getElementById('mute-btn');
-            btn.classList.toggle('active');
-            
-            // Update UI Self
-            const selfUI = document.getElementById(`vc-u-${userId}`);
-            if(selfUI) {
-                const av = selfUI.querySelector('.vc-avatar');
-                const mic = selfUI.querySelector('.vc-mic-icon');
-                if(isMuted) { av.classList.add('muted'); mic.style.display='flex'; }
-                else { av.classList.remove('muted'); mic.style.display='none'; }
-            }
-
-            // Broadcast Status
-            ws.send(JSON.stringify({
-                type: "vc_update",
-                status: { muted: isMuted }
-            }));
+            // UI
+            document.getElementById(`mic-${state.uid}`).style.display = isMuted ? 'flex' : 'none';
+            sendVc({type: "vc_update", muted: isMuted});
         }
 
         function leaveVoice() {
-            if (peer) peer.destroy();
-            if (myStream) myStream.getTracks().forEach(track => track.stop());
+            if(peer) peer.destroy();
+            if(myStream) myStream.getTracks().forEach(t => t.stop());
+            if(micLoop) clearInterval(micLoop);
+            if(audioCtx) audioCtx.close();
             
-            peer = null;
-            myStream = null;
-            peers = {};
-            vcUsers.clear();
+            document.getElementById('vc-modal').style.display = 'none';
             document.getElementById('vc-grid').innerHTML = '';
             document.getElementById('audio-container').innerHTML = '';
-            document.getElementById('vc-modal').style.display = 'none';
         }
+
     </script>
 </body>
 </html>
