@@ -11,10 +11,10 @@ from pydantic import BaseModel
 from redis import asyncio as aioredis
 
 # ==========================================
-#   KUSTIFY HYPER-X | CONFIGURATION
+#   KUSTIFY HYPER-X | V9.0 (STABLE)
 # ==========================================
 
-app = FastAPI(title="Kustify Hyper-X", description="Next-Gen Infrastructure Chat", version="8.0")
+app = FastAPI(title="Kustify Hyper-X", description="Next-Gen Infrastructure Chat", version="9.0")
 
 # 1. Redis Configuration
 REDIS_URL = os.getenv("UPSTASH_REDIS_URL") or os.getenv("UPSTASH_REDIS_REST_URL")
@@ -43,50 +43,76 @@ s3_client = boto3.client(
 )
 
 # Constants
-GLOBAL_CHANNEL = "kustify:global:v8"
-GROUPS_KEY = "kustify:groups:v8"
-HISTORY_KEY = "kustify:history:v8:"
+GLOBAL_CHANNEL = "kustify:global:v9"
+GROUPS_KEY = "kustify:groups:v9"
+HISTORY_KEY = "kustify:history:v9:"
+USERNAMES_KEY = "kustify:usernames:v9"
 
 class GroupCreate(BaseModel):
     name: str
 
 class ConnectionManager:
     def __init__(self):
-        # Active sockets: {group_id: [ws1, ws2]}
+        # Group connections: {group_id: [ws1, ws2]}
         self.active_connections: Dict[str, List[WebSocket]] = {}
-        # User presence: {group_id: {user_id: user_info}}
-        self.presence: Dict[str, Dict[str, dict]] = {}
+        # Global user lookup for DMs: {user_id: WebSocket}
+        self.global_lookup: Dict[str, WebSocket] = {}
+        # User Metadata: {user_id: {name, pfp, current_group}}
+        self.user_meta: Dict[str, dict] = {}
 
     async def connect(self, websocket: WebSocket, group_id: str, user_info: dict):
-        await websocket.accept()
+        # Note: WebSocket accept handled in endpoint to allow error sending before accept
+        uid = user_info['id']
+        
+        # 1. Register to Group
         if group_id not in self.active_connections:
             self.active_connections[group_id] = []
-            self.presence[group_id] = {}
-        
         self.active_connections[group_id].append(websocket)
-        self.presence[group_id][user_info['id']] = user_info
         
-        # Broadcast presence update
-        await self.broadcast_system(group_id, "presence_update", {
-            "count": len(self.active_connections[group_id]),
-            "users": list(self.presence[group_id].values())
-        })
+        # 2. Register Global (for DMs)
+        self.global_lookup[uid] = websocket
+        self.user_meta[uid] = {**user_info, "group": group_id}
+        
+        # 3. Broadcast Group Update
+        await self.broadcast_presence(group_id)
 
     def disconnect(self, websocket: WebSocket, group_id: str, user_id: str):
+        # 1. Remove from Group
         if group_id in self.active_connections:
             if websocket in self.active_connections[group_id]:
                 self.active_connections[group_id].remove(websocket)
+                if not self.active_connections[group_id]:
+                    del self.active_connections[group_id]
+        
+        # 2. Remove Global
+        if user_id in self.global_lookup:
+            del self.global_lookup[user_id]
+        if user_id in self.user_meta:
+            del self.user_meta[user_id]
             
-            if user_id in self.presence[group_id]:
-                del self.presence[group_id][user_id]
+        return group_id
+
+    async def broadcast_presence(self, group_id: str):
+        """Sends user list to everyone in group"""
+        if group_id not in self.active_connections:
+            return
             
-            # If group empty, cleanup
-            if not self.active_connections[group_id]:
-                del self.active_connections[group_id]
-                del self.presence[group_id]
+        # Gather users in this group
+        users_in_group = [
+            meta for uid, meta in self.user_meta.items() 
+            if meta.get("group") == group_id
+        ]
+        
+        payload = json.dumps({
+            "type": "presence_update",
+            "group_id": group_id,
+            "count": len(users_in_group),
+            "users": users_in_group
+        })
+        await self.broadcast_local(group_id, payload)
 
     async def broadcast_local(self, group_id: str, message: str):
-        """Sends data to local websockets only"""
+        """Sends data to local websockets in a group"""
         if group_id in self.active_connections:
             for connection in self.active_connections[group_id]:
                 try:
@@ -94,15 +120,19 @@ class ConnectionManager:
                 except Exception:
                     pass
 
-    async def broadcast_system(self, group_id: str, type_: str, data: dict):
-        """Helper to send non-chat system events"""
-        payload = {"type": type_, "group_id": group_id, **data}
-        await self.broadcast_local(group_id, json.dumps(payload))
+    async def send_personal_message(self, target_id: str, message: str):
+        """Sends a direct message to a specific user ID"""
+        if target_id in self.global_lookup:
+            try:
+                await self.global_lookup[target_id].send_text(message)
+                return True
+            except:
+                return False
+        return False
 
 manager = ConnectionManager()
 
 # --- REDIS LISTENER WORKER ---
-# Listens for messages from other server instances (scalability)
 async def redis_listener():
     pubsub = redis.pubsub()
     await pubsub.subscribe(GLOBAL_CHANNEL)
@@ -110,18 +140,31 @@ async def redis_listener():
         if message["type"] == "message":
             try:
                 data = json.loads(message["data"])
-                group_id = data.get("group_id")
-                # We broadcast everything from Redis to Local Sockets
-                if group_id:
-                    await manager.broadcast_local(group_id, message["data"])
+                mtype = data.get("type")
+                
+                # Group Broadcast
+                if mtype == "message" or mtype == "vc_signal_group":
+                    group_id = data.get("group_id")
+                    if group_id:
+                        await manager.broadcast_local(group_id, message["data"])
+                
+                # DM Routing (Inter-server capability via Redis)
+                elif mtype == "dm":
+                    target_id = data.get("target_id")
+                    if target_id:
+                        # Try to send locally
+                        await manager.send_personal_message(target_id, message["data"])
+
             except Exception as e:
-                print(f"Redis Broadcast Error: {e}")
+                print(f"Redis Error: {e}")
 
 @app.on_event("startup")
 async def startup_event():
     # Ensure default lobby
     if not await redis.sismember(GROUPS_KEY, "Lobby"):
         await redis.sadd(GROUPS_KEY, "Lobby")
+    # Clean usernames on restart (optional, risks name collision if persistence needed, but good for ephemeral)
+    # await redis.delete(USERNAMES_KEY) 
     asyncio.create_task(redis_listener())
 
 # ==========================================
@@ -135,8 +178,8 @@ async def get_groups():
 
 @app.post("/api/groups")
 async def create_group(group: GroupCreate):
-    # Sanitize
     name = re.sub(r'[^a-zA-Z0-9 _-]', '', group.name)
+    if not name: return JSONResponse(status_code=400, content={"error": "Invalid name"})
     await redis.sadd(GROUPS_KEY, name)
     return {"status": "success", "group": name}
 
@@ -149,18 +192,13 @@ async def get_history(group_id: str, limit: int = 100):
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
-        # Generate unique filename
         ext = file.filename.split('.')[-1]
         safe_name = f"{int(time.time())}_{os.urandom(4).hex()}.{ext}"
-        file_key = f"kustify_hyper/{safe_name}"
-        
+        file_key = f"kustify_v9/{safe_name}"
         s3_client.upload_fileobj(
             file.file, BUCKET_NAME, file_key,
             ExtraArgs={'ContentType': file.content_type, 'ACL': 'public-read'}
         )
-        # Assuming standard public S3/R2 URL structure. Adjust if using presigned only.
-        # For this "Wild" version, we assume public read ACL or bucket policy.
-        # If strict private, use presigned (as in previous code).
         url = s3_client.generate_presigned_url(
             'get_object', Params={'Bucket': BUCKET_NAME, 'Key': file_key}, ExpiresIn=604800
         )
@@ -174,44 +212,35 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.websocket("/ws/{group_id}/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
-    # We expect the client to send an "init" packet immediately after connecting
-    # But for simplicity, we accept connection first
     await websocket.accept()
     
-    # Wait for handshake with User Name/PFP
+    # 1. HANDSHAKE & UNIQUE NAME CHECK
     try:
         init_data = await websocket.receive_json()
-        user_info = {
-            "id": user_id,
-            "name": init_data.get("name", "Anon"),
-            "pfp": init_data.get("pfp", "")
-        }
-    except:
+        name = init_data.get("name", "Anon").strip()
+        pfp = init_data.get("pfp", "")
+        
+        # Check Uniqueness
+        is_new = await redis.sadd(USERNAMES_KEY, name)
+        if is_new == 0:
+            # Name taken
+            await websocket.send_json({"type": "error", "message": "NAME_TAKEN"})
+            await websocket.close()
+            return
+            
+        user_info = {"id": user_id, "name": name, "pfp": pfp}
+        
+    except Exception:
         await websocket.close()
         return
 
-    # Actually register connection
-    # Note: We accepted above, but now we register with manager
-    # Re-using the manager logic but passing the socket we already accepted? 
-    # The manager.connect usually calls accept(), let's adjust manager to NOT accept since we did.
-    # Refactoring manager slightly for this flow:
+    # 2. CONNECT
+    await manager.connect(websocket, group_id, user_info)
     
-    if group_id not in manager.active_connections:
-        manager.active_connections[group_id] = []
-        manager.presence[group_id] = {}
-    manager.active_connections[group_id].append(websocket)
-    manager.presence[group_id][user_id] = user_info
-    
-    # Broadcast join
-    await manager.broadcast_system(group_id, "presence_update", {
-        "count": len(manager.active_connections[group_id]),
-        "users": list(manager.presence[group_id].values())
-    })
-    
-    # Send system welcome
+    # Welcome
     await websocket.send_text(json.dumps({
         "type": "system", 
-        "text": f"Connected to infrastructure node: {group_id}"
+        "text": f"Secure Connection Established: {group_id.upper()}"
     }))
 
     try:
@@ -224,15 +253,7 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
             if mtype == "heartbeat":
                 await websocket.send_text(json.dumps({"type": "heartbeat_ack"}))
 
-            # --- TYPING STATUS ---
-            elif mtype == "typing":
-                # Broadcast only to others, don't store
-                await manager.broadcast_system(group_id, "user_typing", {
-                    "user_id": user_id,
-                    "user_name": user_info["name"]
-                })
-
-            # --- CHAT MESSAGES ---
+            # --- GROUP MESSAGES ---
             elif mtype == "message":
                 msg_id = f"{user_id}-{int(time.time()*1000)}"
                 out = {
@@ -240,73 +261,69 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
                     "id": msg_id,
                     "group_id": group_id,
                     "user_id": user_id,
-                    "user_name": user_info["name"],
-                    "user_pfp": user_info["pfp"],
+                    "user_name": name,
+                    "user_pfp": pfp,
                     "text": data.get("text"),
                     "image_url": data.get("image_url"),
-                    "style": data.get("style", "normal"), # For /shout etc
-                    "timestamp": time.time(),
-                    "reactions": {}
+                    "style": data.get("style", "normal"),
+                    "timestamp": time.time()
                 }
-                # Store in Redis
                 await redis.rpush(f"{HISTORY_KEY}{group_id}", json.dumps(out))
-                # Publish to Redis (triggers listener -> broadcasts to all)
                 await redis.publish(GLOBAL_CHANNEL, json.dumps(out))
 
-            # --- REACTIONS ---
-            elif mtype == "react":
-                target_msg_id = data.get("msg_id")
-                emoji = data.get("emoji")
-                # This is tricky with Redis Lists (immutable mostly). 
-                # For "Wild" demo, we will just broadcast the reaction event 
-                # Clients handle visual state locally. 
-                # (Production would use a Hash for msg state)
-                await manager.broadcast_system(group_id, "reaction_add", {
-                    "msg_id": target_msg_id,
-                    "user_id": user_id,
-                    "emoji": emoji
-                })
+            # --- DIRECT MESSAGES (DMs) ---
+            elif mtype == "dm":
+                target_id = data.get("target_id")
+                if target_id:
+                    out = {
+                        "type": "dm",
+                        "sender_id": user_id,
+                        "sender_name": name,
+                        "sender_pfp": pfp,
+                        "target_id": target_id,
+                        "text": data.get("text"),
+                        "timestamp": time.time()
+                    }
+                    # Send to target via Redis (to reach across workers)
+                    await redis.publish(GLOBAL_CHANNEL, json.dumps(out))
+                    # Echo back to sender so they see it
+                    await websocket.send_text(json.dumps(out))
 
-            # --- VOICE CHAT SIGNALING ---
-            # All VC logic is pass-through to group members
-            elif mtype in ["vc_join", "vc_leave", "vc_signal", "vc_talking", "vc_update"]:
-                # Attach sender ID for security
+            # --- VOICE CHAT (VC) ---
+            elif mtype in ["vc_join", "vc_leave", "vc_signal", "vc_talking"]:
                 data["sender_id"] = user_id
-                # Add sender info if join
                 if mtype == "vc_join":
-                    data["user_name"] = user_info["name"]
-                    data["user_pfp"] = user_info["pfp"]
+                    data["user_name"] = name
+                    data["user_pfp"] = pfp
                 
-                # Broadcast directly to group via Redis to reach all nodes
-                # We wrap it to ensure it goes through the redis_listener
-                wrapper = {
-                    "type": "message", # Abuse message type to hit listener? No, listener checks type.
-                    # The listener currently checks message["type"] == "message".
-                    # Let's just broadcast local for signaling speed (Mesh usually local-ish) 
-                    # OR publish raw.
-                }
-                # For speed, direct local broadcast is best, but multi-worker needs Redis.
-                # Let's wrap in a container the listener understands if we want scaling.
-                # For this file, let's assume single-worker or sticky sessions for VC usually.
-                # But to be safe, we broadcast to group.
-                await manager.broadcast_local(group_id, json.dumps(data))
-
+                data["group_id"] = group_id
+                
+                if mtype == "vc_signal":
+                    # P2P Signal -> Route specific
+                    target = data.get("target_id")
+                    if target:
+                        payload = json.dumps({"type": "dm", "target_id": target, **data})
+                        await redis.publish(GLOBAL_CHANNEL, payload)
+                else:
+                    # General VC Event -> Broadcast Group
+                    data["type"] = "vc_signal_group" # Wrapper for listener
+                    await redis.publish(GLOBAL_CHANNEL, json.dumps(data))
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, group_id, user_id)
-        # Notify leaving
-        await manager.broadcast_system(group_id, "presence_update", {
-            "count": len(manager.active_connections.get(group_id, [])),
-            "users": list(manager.presence.get(group_id, {}).values())
-        })
-        # If in VC, auto-leave logic handled by client timeouts or specific leave packets
-        # But we send a force leave just in case
-        await manager.broadcast_local(group_id, json.dumps({
-            "type": "vc_leave", "sender_id": user_id
+        # Release Name
+        await redis.srem(USERNAMES_KEY, name)
+        # Broadcast Presence & VC Leave
+        await manager.broadcast_presence(group_id)
+        await redis.publish(GLOBAL_CHANNEL, json.dumps({
+            "type": "vc_signal_group",
+            "group_id": group_id,
+            "sender_id": user_id,
+            "subtype": "vc_leave" # Explicit subtype
         }))
 
 # ==========================================
-#   FRONTEND APPLICATION (SINGLE FILE)
+#   FRONTEND APPLICATION
 # ==========================================
 
 @app.get("/")
@@ -318,7 +335,7 @@ html_content = """
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>KUSTIFY HYPER-X</title>
     <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.0.2/marked.min.js"></script>
@@ -326,7 +343,7 @@ html_content = """
     <style>
         :root {
             --bg-dark: #050505;
-            --panel: rgba(20, 20, 23, 0.65);
+            --panel: rgba(20, 20, 23, 0.85);
             --border: rgba(255, 255, 255, 0.08);
             --primary: #7000ff;
             --accent: #00f3ff;
@@ -342,7 +359,7 @@ html_content = """
             font-family: 'Outfit', sans-serif;
             background: var(--bg-dark);
             color: var(--text-main);
-            height: 100vh;
+            height: 100dvh; /* Dynamic Viewport Height for Mobile */
             overflow: hidden;
             display: flex;
         }
@@ -350,21 +367,20 @@ html_content = """
         /* INFRASTRUCTURE BACKGROUND */
         #infra-canvas {
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            z-index: 0; opacity: 0.4; pointer-events: none;
+            z-index: 0; opacity: 0.3; pointer-events: none;
         }
 
         /* SCROLLBARS */
-        ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
 
         /* SIDEBAR */
         #sidebar {
             width: 280px;
-            background: rgba(10, 10, 12, 0.6);
+            background: rgba(10, 10, 12, 0.8);
             backdrop-filter: var(--glass);
             border-right: 1px solid var(--border);
-            z-index: 10;
+            z-index: 20;
             display: flex; flex-direction: column;
             transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         }
@@ -375,9 +391,6 @@ html_content = """
             font-weight: 800;
             font-size: 1.2rem;
             letter-spacing: -1px;
-            background: linear-gradient(90deg, #fff, #888);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
             border-bottom: 1px solid var(--border);
             display: flex; justify-content: space-between; align-items: center;
         }
@@ -391,19 +404,19 @@ html_content = """
         .user-card img {
             width: 42px; height: 42px; border-radius: 12px;
             border: 2px solid var(--primary);
-            box-shadow: 0 0 15px rgba(112, 0, 255, 0.4);
         }
-        .status-dot { width: 8px; height: 8px; background: #10b981; border-radius: 50%; box-shadow: 0 0 8px #10b981; }
 
         .nav-list { flex: 1; padding: 15px; overflow-y: auto; }
+        .section-label { padding: 10px 5px; font-size: 0.7rem; color: #666; font-weight: 700; letter-spacing: 1px; margin-top: 10px; }
+        
         .nav-item {
-            padding: 12px 16px; margin-bottom: 6px;
+            padding: 12px 14px; margin-bottom: 6px;
             border-radius: 8px;
             color: var(--text-dim);
             font-size: 0.95rem;
             cursor: pointer;
             transition: 0.2s;
-            display: flex; justify-content: space-between;
+            display: flex; justify-content: space-between; align-items: center;
         }
         .nav-item:hover { background: rgba(255,255,255,0.05); color: #fff; }
         .nav-item.active { 
@@ -411,149 +424,132 @@ html_content = """
             color: var(--accent); 
             border-left: 3px solid var(--accent);
         }
+        .dm-badge { width: 8px; height: 8px; background: var(--primary); border-radius: 50%; }
 
         .btn-create {
-            margin: 20px; padding: 12px;
+            margin: 20px; padding: 14px;
             border: 1px dashed var(--border);
             color: var(--text-dim);
-            text-align: center; border-radius: 8px;
+            text-align: center; border-radius: 12px;
             cursor: pointer; font-size: 0.9rem;
             transition: 0.2s;
         }
-        .btn-create:hover { border-color: var(--primary); color: var(--primary); background: rgba(112, 0, 255, 0.05); }
 
-        /* CHAT AREA */
+        /* MAIN AREA */
         #main-view {
             flex: 1; display: flex; flex-direction: column;
             position: relative; z-index: 5;
-            background: radial-gradient(circle at top right, rgba(112,0,255,0.05), transparent 40%);
+            background: radial-gradient(circle at top right, rgba(112,0,255,0.08), transparent 40%);
         }
 
         header {
             height: 70px;
             display: flex; justify-content: space-between; align-items: center;
-            padding: 0 30px;
+            padding: 0 20px;
             border-bottom: 1px solid var(--border);
             background: rgba(5, 5, 5, 0.4);
             backdrop-filter: blur(10px);
         }
         .room-info h2 { font-size: 1.1rem; font-weight: 600; display: flex; align-items: center; gap: 10px; }
-        .live-badge { font-size: 0.7rem; padding: 2px 8px; background: rgba(255,0,0,0.2); color: #ff4444; border-radius: 4px; border: 1px solid rgba(255,0,0,0.3); display: none; }
+        .live-badge { font-size: 0.7rem; padding: 4px 10px; background: rgba(0, 243, 255, 0.1); color: var(--accent); border-radius: 20px; border: 1px solid rgba(0, 243, 255, 0.3); display: none; }
         
-        .action-bar { display: flex; gap: 10px; }
-        .btn-icon { width: 40px; height: 40px; border-radius: 50%; border: 1px solid var(--border); background: rgba(255,255,255,0.05); color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: 0.2s; }
-        .btn-icon:hover { background: var(--primary); border-color: var(--primary); transform: translateY(-2px); }
+        .btn-icon { 
+            width: 44px; height: 44px; border-radius: 50%; 
+            border: 1px solid var(--border); background: rgba(255,255,255,0.05); 
+            color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; 
+            transition: 0.2s; font-size: 1.2rem;
+        }
+        .btn-icon:hover { background: var(--primary); border-color: var(--primary); }
 
         /* MESSAGES */
         #chat-feed {
-            flex: 1; overflow-y: auto; padding: 20px 30px;
-            display: flex; flex-direction: column; gap: 20px;
+            flex: 1; overflow-y: auto; padding: 20px;
+            display: flex; flex-direction: column; gap: 15px;
+            padding-bottom: 100px; /* Space for input */
         }
 
-        .msg-group { display: flex; gap: 16px; animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1); }
+        .msg-group { display: flex; gap: 12px; animation: slideIn 0.2s ease-out; width: 100%; }
         .msg-group.me { flex-direction: row-reverse; }
         
-        .msg-avatar { width: 40px; height: 40px; border-radius: 10px; object-fit: cover; background: #222; }
+        .msg-avatar { 
+            width: 38px; height: 38px; border-radius: 10px; 
+            object-fit: cover; background: #222; cursor: pointer;
+            border: 2px solid transparent; transition: 0.2s;
+        }
+        .msg-avatar:hover { border-color: var(--accent); }
         
-        .msg-bubbles { display: flex; flex-direction: column; gap: 4px; max-width: 60%; }
+        .msg-bubbles { display: flex; flex-direction: column; gap: 4px; max-width: 75%; }
         .msg-group.me .msg-bubbles { align-items: flex-end; }
         
-        .msg-meta { font-size: 0.8rem; color: var(--text-dim); margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
-        .msg-group.me .msg-meta { flex-direction: row-reverse; }
+        .msg-meta { font-size: 0.75rem; color: var(--text-dim); margin-bottom: 2px; }
 
         .bubble {
-            padding: 12px 18px;
-            border-radius: 4px 18px 18px 18px;
-            background: #18181b;
+            padding: 10px 16px;
+            border-radius: 4px 16px 16px 16px;
+            background: #1e1e22;
             font-size: 0.95rem;
             line-height: 1.5;
             color: #e4e4e7;
-            position: relative;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            border: 1px solid rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.05);
+            word-wrap: break-word;
         }
         .msg-group.me .bubble {
             background: linear-gradient(135deg, #6002ee, #9c27b0);
-            border-radius: 18px 4px 18px 18px;
+            border-radius: 16px 4px 16px 16px;
             border: none;
         }
-        
-        .bubble img { max-width: 100%; border-radius: 8px; margin-top: 8px; cursor: pointer; }
-        
-        .shout { font-size: 1.5rem; font-weight: 800; padding: 20px 30px; background: linear-gradient(45deg, #ff0055, #ff00aa); color: white; border: 2px solid #fff; box-shadow: 0 0 20px #ff0055; animation: shake 0.5s; }
+        .dm-bubble { border: 1px solid var(--accent); background: rgba(0, 243, 255, 0.05); }
 
-        .reaction-bar { position: absolute; bottom: -12px; right: 0; display: flex; gap: -5px; }
-        .reaction { font-size: 0.8rem; background: #2a2a2e; padding: 2px 6px; border-radius: 10px; border: 1px solid #444; }
+        .bubble img { max-width: 100%; border-radius: 8px; margin-top: 8px; }
 
         /* INPUT AREA */
         .input-wrapper {
-            padding: 24px;
-            background: rgba(5,5,5,0.8);
+            position: absolute; bottom: 0; left: 0; width: 100%;
+            padding: 15px;
+            background: rgba(5,5,5,0.9);
+            backdrop-filter: blur(20px);
             border-top: 1px solid var(--border);
-            display: flex; gap: 12px; align-items: flex-end;
+            display: flex; gap: 10px; align-items: center;
         }
-        
-        .typing-indicator { position: absolute; bottom: 80px; left: 30px; font-size: 0.75rem; color: var(--accent); opacity: 0; transition: 0.3s; }
         
         .chat-input-box {
             flex: 1; background: #121214;
             border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 14px;
-            color: #fff;
-            min-height: 50px;
-            max-height: 150px;
-            overflow-y: auto;
-            font-family: inherit;
+            border-radius: 25px;
+            padding: 12px 20px;
+            color: #fff; font-size: 1rem;
         }
-        .chat-input-box:focus { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(112, 0, 255, 0.2); }
+        .chat-input-box:focus { border-color: var(--primary); }
 
         /* VOICE WIDGET */
         #vc-panel {
             position: absolute; top: 80px; right: 20px;
-            width: 320px;
-            background: rgba(15, 15, 20, 0.9);
+            width: 300px;
+            background: rgba(15, 15, 20, 0.95);
             backdrop-filter: blur(30px);
             border: 1px solid rgba(255,255,255,0.1);
             border-radius: 20px;
-            box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+            box-shadow: 0 20px 50px rgba(0,0,0,0.6);
             display: none; flex-direction: column;
-            overflow: hidden;
-            animation: popIn 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+            z-index: 50;
         }
-        
-        .vc-visualizer { width: 100%; height: 60px; background: #000; position: relative; }
-        .vc-canvas { width: 100%; height: 100%; opacity: 0.7; }
-
         .vc-grid { padding: 15px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; max-height: 200px; overflow-y: auto; }
-        .vc-slot { display: flex; flex-direction: column; align-items: center; gap: 5px; position: relative; }
-        .vc-slot img { width: 44px; height: 44px; border-radius: 50%; border: 2px solid #333; transition: 0.2s; object-fit: cover; }
-        .vc-slot.talking img { border-color: #00f3ff; box-shadow: 0 0 15px #00f3ff; transform: scale(1.1); }
-        .vc-slot.muted::after { content: '🚫'; position: absolute; bottom: 15px; right: 0; font-size: 12px; background: #000; border-radius: 50%; }
-
-        .vc-controls { padding: 15px; display: flex; justify-content: center; gap: 15px; background: rgba(0,0,0,0.3); }
+        .vc-slot { display: flex; flex-direction: column; align-items: center; position: relative; }
+        .vc-slot img { width: 44px; height: 44px; border-radius: 50%; border: 2px solid #333; object-fit: cover; }
+        .vc-slot.talking img { border-color: var(--accent); box-shadow: 0 0 10px var(--accent); }
         
-        /* SETUP MODAL */
+        /* MODAL */
         .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 100; display: flex; align-items: center; justify-content: center; }
-        .modal-content { width: 350px; text-align: center; animation: slideUp 0.4s; }
-        .pfp-preview-box { width: 100px; height: 100px; margin: 0 auto 20px; position: relative; }
-        .pfp-preview { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; border: 3px solid var(--accent); }
-        .modern-input { width: 100%; background: transparent; border: none; border-bottom: 2px solid #333; color: white; font-size: 1.5rem; text-align: center; padding: 10px; margin-bottom: 30px; }
-        .modern-input:focus { border-color: var(--accent); }
-        .btn-start { background: white; color: black; border: none; padding: 15px 40px; border-radius: 30px; font-weight: 800; cursor: pointer; font-size: 1rem; transition: 0.2s; }
-        .btn-start:hover { transform: scale(1.05); box-shadow: 0 0 20px rgba(255,255,255,0.4); }
+        .modal-content { width: 90%; max-width: 400px; text-align: center; background: #111; padding: 30px; border-radius: 20px; border: 1px solid #333; }
+        .modern-input { width: 100%; background: #222; border: 1px solid #333; color: white; padding: 15px; border-radius: 10px; margin: 20px 0; text-align: center; font-size: 1.1rem; }
+        .btn-start { background: var(--primary); color: white; border: none; padding: 15px; width: 100%; border-radius: 10px; font-weight: 700; cursor: pointer; font-size: 1rem; }
 
-        /* UTILS */
-        .hidden { display: none !important; }
-        @keyframes slideIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes popIn { from { opacity: 0; transform: scale(0.9); } to { opacity: 1; transform: scale(1); } }
-        @keyframes slideUp { from { opacity: 0; transform: translateY(50px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes shake { 0% { transform: translateX(0); } 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } 100% { transform: translateX(0); } }
-
-        /* MOBILE */
         @media (max-width: 768px) {
-            #sidebar { position: fixed; height: 100%; transform: translateX(-100%); width: 85%; box-shadow: 10px 0 30px rgba(0,0,0,0.5); }
+            #sidebar { position: fixed; height: 100dvh; transform: translateX(-100%); width: 85%; }
             #sidebar.open { transform: translateX(0); }
+            #vc-panel { width: 94%; right: 3%; top: 70px; }
+            .bubble { font-size: 1rem; }
+            .btn-icon { width: 40px; height: 40px; }
         }
     </style>
 </head>
@@ -563,72 +559,67 @@ html_content = """
 
     <div id="setup-modal" class="modal">
         <div class="modal-content">
-            <h1 style="margin-bottom: 10px; font-family: 'JetBrains Mono'; color:var(--accent)">INIT_PROFILE</h1>
-            <p style="color:#666; margin-bottom: 30px;">Identify yourself on the network</p>
-            
-            <div class="pfp-preview-box" onclick="document.getElementById('pfp-upload').click()">
-                <img id="preview-pfp" class="pfp-preview" src="https://ui-avatars.com/api/?background=random&name=User">
-                <div style="position:absolute; bottom:0; right:0; background:var(--primary); width:30px; height:30px; border-radius:50%; display:flex; align-items:center; justify-content:center;">📷</div>
+            <h2 style="font-family:'JetBrains Mono'; color:var(--accent)">IDENTITY_INIT</h2>
+            <div style="margin: 20px auto; width: 100px; height: 100px; position: relative;">
+                <img id="preview-pfp" src="https://ui-avatars.com/api/?background=random&name=?" style="width:100%; height:100%; border-radius:50%; object-fit:cover; border:2px solid #333;">
+                <label for="pfp-upload" style="position:absolute; bottom:0; right:0; background:var(--primary); width:32px; height:32px; border-radius:50%; display:flex; align-items:center; justify-content:center;">📷</label>
             </div>
             <input type="file" id="pfp-upload" hidden onchange="uploadPfp()">
-            
-            <input type="text" id="username-input" class="modern-input" placeholder="Alias" maxlength="15">
-            <button class="btn-start" onclick="saveProfile()">CONNECT</button>
+            <input type="text" id="username-input" class="modern-input" placeholder="Unique Alias" maxlength="12">
+            <button class="btn-start" onclick="connectToServer()">ENTER SYSTEM</button>
+            <p id="error-msg" style="color:#ff4444; font-size:0.8rem; margin-top:10px; display:none;">Alias Taken</p>
         </div>
     </div>
 
     <div id="sidebar">
         <div class="brand-area">
-            KUSTIFY HYPER-X
+            KUSTIFY V9
             <span onclick="toggleSidebar()" style="cursor:pointer; font-size:1.5rem; display:none;" id="close-side">×</span>
         </div>
         <div class="user-card">
             <img id="side-pfp">
             <div>
                 <div id="side-name" style="font-weight:700"></div>
-                <div style="font-size:0.75rem; color:var(--accent)">● ONLINE</div>
+                <div style="font-size:0.75rem; color:var(--accent)">● SECURE</div>
             </div>
         </div>
-        <div style="padding: 15px 15px 5px; font-size:0.75rem; color:#666; font-weight:700;">NODES</div>
-        <div class="nav-list" id="group-list">
-            </div>
-        <div class="btn-create" onclick="createGroup()">+ Initialize New Node</div>
+        
+        <div class="nav-list" id="nav-list">
+            <div class="section-label">CHANNELS</div>
+            <div id="group-list"></div>
+            
+            <div class="section-label">DIRECT MESSAGES</div>
+            <div id="dm-list"></div>
+        </div>
+        <div class="btn-create" onclick="createGroup()">+ New Node</div>
     </div>
 
     <div id="main-view">
         <header>
             <div class="room-info">
-                <div>
-                    <button onclick="toggleSidebar()" class="btn-icon" style="display:inline-flex; width:30px; height:30px; margin-right:10px;">☰</button> 
-                    <span id="header-title"># Lobby</span>
-                </div>
-                <div id="presence-count" style="font-size:0.8rem; color:var(--text-dim); margin-top:4px;">1 User Connected</div>
+                <button onclick="toggleSidebar()" class="btn-icon" style="margin-right:10px; border:none; background:transparent;">☰</button> 
+                <span id="header-title"># Lobby</span>
             </div>
-            <div class="action-bar">
-                <span class="live-badge" id="vc-badge">VOICE ACTIVE</span>
+            <div style="display:flex; gap:10px; align-items:center;">
+                <span class="live-badge" id="vc-badge">VOICE</span>
                 <button class="btn-icon" onclick="joinVoice()" id="join-vc-btn">🎤</button>
             </div>
         </header>
 
         <div id="chat-feed"></div>
 
-        <div class="typing-indicator" id="typing-indicator">Someone is typing...</div>
-
         <div class="input-wrapper">
             <button class="btn-icon" onclick="document.getElementById('file-input').click()">+</button>
             <input type="file" id="file-input" hidden onchange="handleFile()">
-            
-            <input type="text" id="msg-input" class="chat-input-box" placeholder="Execute command or send message..." autocomplete="off">
+            <input type="text" id="msg-input" class="chat-input-box" placeholder="Message..." autocomplete="off">
             <button class="btn-icon" style="background:var(--primary); border-color:var(--primary)" onclick="sendMessage()">➤</button>
         </div>
     </div>
 
     <div id="vc-panel">
-        <div class="vc-visualizer">
-            <canvas id="viz-canvas" class="vc-canvas"></canvas>
-        </div>
+        <div style="padding:15px; border-bottom:1px solid rgba(255,255,255,0.1); font-size:0.8rem; font-weight:700;">VOICE LINK</div>
         <div class="vc-grid" id="vc-grid"></div>
-        <div class="vc-controls">
+        <div style="padding:15px; display:flex; justify-content:center; gap:15px;">
             <button class="btn-icon" onclick="toggleMute()" id="mute-btn">🎙️</button>
             <button class="btn-icon" style="background:#ff4444; border-color:#ff4444" onclick="leaveVoice()">✖</button>
         </div>
@@ -637,43 +628,31 @@ html_content = """
     <div id="audio-container" hidden></div>
 
     <script>
-        // ==========================================
-        //   CLIENT LOGIC
-        // ==========================================
-        
-        // --- SOUNDS (Base64 for single file portability) ---
-        const SOUNDS = {
-            pop: new Audio("data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YU..."), // Placeholder, browsers block auto-audio often. Using visual feedback mostly.
-        };
-
-        // --- STATE ---
+        // --- STATE MANAGEMENT ---
         const state = {
-            user: localStorage.getItem("khx_user") || "",
-            uid: localStorage.getItem("khx_uid") || "u_" + Math.random().toString(36).substr(2, 8),
-            pfp: localStorage.getItem("khx_pfp") || `https://ui-avatars.com/api/?background=0D8ABC&color=fff&name=User`,
+            user: localStorage.getItem("kv9_user") || "",
+            uid: localStorage.getItem("kv9_uid") || "u_" + Math.random().toString(36).substr(2, 8),
+            pfp: localStorage.getItem("kv9_pfp") || `https://ui-avatars.com/api/?background=random&color=fff&name=User`,
             group: "Lobby",
+            dmTarget: null, // If set, we are in DM mode
             ws: null,
-            hbInterval: null
+            dms: {}, // Store DM history locally for this session
+            users: [] // List of online users in current group
         };
-        localStorage.setItem("khx_uid", state.uid);
+        localStorage.setItem("kv9_uid", state.uid);
 
-        let typingTimeout = null;
+        if(window.innerWidth < 768) document.getElementById('close-side').style.display='block';
 
-        // --- INIT ---
+        // --- SETUP ---
         window.onload = () => {
             initBackground();
-            if (state.user) {
-                document.getElementById('setup-modal').classList.add('hidden');
-                updateProfileUI();
-                initApp();
-            } else {
-                document.getElementById('preview-pfp').src = state.pfp;
+            document.getElementById('preview-pfp').src = state.pfp;
+            if(state.user) {
+                // We don't auto-login because we need to check name uniqueness every session
+                document.getElementById('username-input').value = state.user;
             }
-            // Mobile check
-            if(window.innerWidth < 768) document.getElementById('close-side').style.display='block';
         };
 
-        // --- PROFILE ---
         async function uploadPfp() {
             const f = document.getElementById('pfp-upload').files[0];
             if(!f) return;
@@ -683,18 +662,18 @@ html_content = """
                 const d = await r.json();
                 state.pfp = d.url;
                 document.getElementById('preview-pfp').src = state.pfp;
-            } catch(e) { alert("Upload Failed"); }
+            } catch(e){}
         }
 
-        function saveProfile() {
+        function connectToServer() {
             const n = document.getElementById('username-input').value.trim();
-            if(!n) return alert("Identify yourself.");
+            if(!n) return;
             state.user = n;
-            localStorage.setItem("khx_user", n);
-            localStorage.setItem("khx_pfp", state.pfp);
-            document.getElementById('setup-modal').classList.add('hidden');
+            localStorage.setItem("kv9_user", n);
+            localStorage.setItem("kv9_pfp", state.pfp);
+            
             updateProfileUI();
-            initApp();
+            initConnection();
         }
 
         function updateProfileUI() {
@@ -702,12 +681,10 @@ html_content = """
             document.getElementById('side-name').innerText = state.user;
         }
 
-        function toggleSidebar() {
-            document.getElementById('sidebar').classList.toggle('open');
-        }
+        function toggleSidebar() { document.getElementById('sidebar').classList.toggle('open'); }
 
-        // --- APP & CHAT ---
-        async function initApp() {
+        // --- WEBSOCKET & LOGIC ---
+        function initConnection() {
             loadGroups();
             connect(state.group);
         }
@@ -719,132 +696,144 @@ html_content = """
             l.innerHTML = '';
             d.groups.forEach(g => {
                 const el = document.createElement('div');
-                el.className = `nav-item ${g === state.group ? 'active' : ''}`;
+                el.className = `nav-item ${g === state.group && !state.dmTarget ? 'active' : ''}`;
                 el.innerHTML = `<span># ${g}</span>`;
-                el.onclick = () => {
-                    if(window.innerWidth < 768) toggleSidebar();
-                    connect(g);
-                };
+                el.onclick = () => { switchChannel(g); };
                 l.appendChild(el);
             });
         }
 
         async function createGroup() {
-            const n = prompt("NODE IDENTIFIER:");
+            const n = prompt("Channel Name:");
             if(n) {
-                await fetch('/api/groups', {
-                    method:'POST', 
-                    headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify({name: n})
-                });
+                await fetch('/api/groups', {method:'POST', body:JSON.stringify({name:n}), headers:{'Content-Type':'application/json'}});
                 loadGroups();
             }
         }
 
+        function switchChannel(group) {
+            state.dmTarget = null;
+            state.group = group;
+            if(window.innerWidth < 768) toggleSidebar();
+            connect(group);
+        }
+
         function connect(group) {
             if(state.ws) state.ws.close();
-            leaveVoice(); // Auto leave voice on switch
+            leaveVoice();
 
-            state.group = group;
+            document.getElementById('setup-modal').style.display = 'none';
             document.getElementById('header-title').innerText = `# ${group}`;
             document.getElementById('chat-feed').innerHTML = '';
-            loadGroups(); // Update active class
+            loadGroups();
 
             // Load History
             fetch(`/api/history/${group}`).then(r=>r.json()).then(msgs => {
                 msgs.forEach(renderMessage);
             });
 
-            // WebSocket
             const proto = location.protocol === 'https:' ? 'wss' : 'ws';
             state.ws = new WebSocket(`${proto}://${location.host}/ws/${group}/${state.uid}`);
 
             state.ws.onopen = () => {
-                // Send Handshake
+                // Handshake
                 state.ws.send(JSON.stringify({name: state.user, pfp: state.pfp}));
-                state.hbInterval = setInterval(() => state.ws.send(JSON.stringify({type:"heartbeat"})), 30000);
+                setInterval(() => state.ws.send(JSON.stringify({type:"heartbeat"})), 30000);
             };
 
             state.ws.onmessage = (e) => {
                 const d = JSON.parse(e.data);
-                handleSocketData(d);
+                
+                if(d.type === "error") {
+                    if(d.message === "NAME_TAKEN") {
+                        document.getElementById('setup-modal').style.display = 'flex';
+                        document.getElementById('error-msg').style.display = 'block';
+                        state.ws.close();
+                    }
+                }
+                else if(d.type === "message") {
+                    if(!state.dmTarget) renderMessage(d);
+                }
+                else if(d.type === "dm") handleIncomingDM(d);
+                else if(d.type === "presence_update") updateUsers(d.users);
+                else if(d.type === "vc_signal_group") handleVcSignal(d);
             };
         }
 
-        function handleSocketData(d) {
-            if(d.type === "message") renderMessage(d);
-            if(d.type === "system") renderSystem(d.text);
-            if(d.type === "user_typing") showTyping(d.user_name);
-            if(d.type === "presence_update") updatePresence(d);
+        // --- DIRECT MESSAGING ---
+        function startDM(uid, name, pfp) {
+            if(uid === state.uid) return;
+            state.dmTarget = {id: uid, name: name, pfp: pfp};
             
-            // VC Handling
-            if(d.type === "vc_join") handleVcJoin(d);
-            if(d.type === "vc_leave") handleVcLeave(d);
-            if(d.type === "vc_talking") highlightSpeaker(d.sender_id, d.vol);
-            if(d.type === "vc_signal" && d.target_id === state.uid) handleSignal(d);
+            // Switch UI
+            document.getElementById('header-title').innerText = `@ ${name}`;
+            document.getElementById('chat-feed').innerHTML = '';
+            
+            // Render local history if any
+            if(state.dms[uid]) {
+                state.dms[uid].forEach(renderMessage);
+            }
+            
+            if(window.innerWidth < 768) toggleSidebar();
+            
+            // Update Sidebar UI
+            updateDMList();
         }
 
+        function handleIncomingDM(d) {
+            // Determine peer ID
+            const peerId = d.sender_id === state.uid ? d.target_id : d.sender_id;
+            
+            // Save to history
+            if(!state.dms[peerId]) state.dms[peerId] = [];
+            state.dms[peerId].push(d);
+
+            // If we are looking at this DM, render it
+            if(state.dmTarget && state.dmTarget.id === peerId) {
+                renderMessage(d);
+            } else {
+                // Notification in sidebar
+                updateDMList();
+            }
+        }
+
+        function updateDMList() {
+            const l = document.getElementById('dm-list');
+            l.innerHTML = '';
+            Object.keys(state.dms).forEach(uid => {
+                const lastMsg = state.dms[uid][state.dms[uid].length-1];
+                const name = lastMsg.sender_id === uid ? lastMsg.sender_name : (state.dmTarget?.id === uid ? state.dmTarget.name : "User");
+                
+                const el = document.createElement('div');
+                el.className = `nav-item ${state.dmTarget?.id === uid ? 'active' : ''}`;
+                el.innerHTML = `<span>@ ${name}</span> <div class="dm-badge"></div>`;
+                el.onclick = () => startDM(uid, name, "");
+                l.appendChild(el);
+            });
+        }
+
+        // --- CHAT RENDERING ---
         function renderMessage(d) {
             const feed = document.getElementById('chat-feed');
-            const isMe = d.user_id === state.uid;
-            
-            // Check if last message was same user to group them (simple visual optimization)
-            const lastMsg = feed.lastElementChild;
-            let group = null;
-            
-            if (lastMsg && lastMsg.dataset.uid === d.user_id) {
-                group = lastMsg;
-            } else {
-                group = document.createElement('div');
-                group.className = `msg-group ${isMe ? 'me' : ''}`;
-                group.dataset.uid = d.user_id;
-                group.innerHTML = `
-                    <img class="msg-avatar" src="${d.user_pfp}">
-                    <div class="msg-bubbles">
-                        <div class="msg-meta">${d.user_name} <span style="font-size:0.7em; opacity:0.5">${new Date(d.timestamp*1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span></div>
+            const isMe = d.sender_id ? (d.sender_id === state.uid) : (d.user_id === state.uid);
+            const pfp = d.sender_pfp || d.user_pfp;
+            const name = d.sender_name || d.user_name;
+            const uid = d.sender_id || d.user_id;
+
+            const grp = document.createElement('div');
+            grp.className = `msg-group ${isMe ? 'me' : ''}`;
+            grp.innerHTML = `
+                <img class="msg-avatar" src="${pfp}" onclick="startDM('${uid}', '${name}', '${pfp}')" title="Message ${name}">
+                <div class="msg-bubbles">
+                    <div class="msg-meta">${name}</div>
+                    <div class="bubble ${d.type === 'dm' ? 'dm-bubble' : ''}">
+                        ${d.text ? marked.parse(d.text) : ''}
+                        ${d.image_url ? `<img src="${d.image_url}">` : ''}
                     </div>
-                `;
-                feed.appendChild(group);
-            }
-
-            const bubbleContainer = group.querySelector('.msg-bubbles');
-            const bubble = document.createElement('div');
-            
-            // Special Styles
-            if (d.style === "shout") {
-                bubble.className = "bubble shout";
-            } else {
-                bubble.className = "bubble";
-            }
-            
-            // Content processing
-            let content = d.text ? marked.parse(d.text) : "";
-            // Auto embed images from text links
-            content = content.replace(/(https?:\/\/.*\.(?:png|jpg|gif|webp))/i, '<br><img src="$1">');
-            
-            if (d.image_url) {
-                content += `<img src="${d.image_url}" onclick="window.open(this.src)">`;
-            }
-
-            bubble.innerHTML = content;
-            bubble.ondblclick = () => {
-                bubble.innerHTML += `<div class="reaction-bar"><span class="reaction">❤️ 1</span></div>`;
-                state.ws.send(JSON.stringify({type: "react", msg_id: d.id, emoji: "❤️"}));
-            };
-
-            bubbleContainer.appendChild(bubble);
+                </div>
+            `;
+            feed.appendChild(grp);
             feed.scrollTop = feed.scrollHeight;
-        }
-
-        function renderSystem(text) {
-            const feed = document.getElementById('chat-feed');
-            const el = document.createElement('div');
-            el.style.textAlign = "center";
-            el.style.fontSize = "0.75rem";
-            el.style.color = "var(--text-dim)";
-            el.style.margin = "10px 0";
-            el.innerText = `SYSTEM: ${text}`;
-            feed.appendChild(el);
         }
 
         function sendMessage() {
@@ -852,158 +841,154 @@ html_content = """
             const txt = inp.value.trim();
             if(!txt) return;
 
-            // Commands
-            if(txt.startsWith('/clear')) {
-                document.getElementById('chat-feed').innerHTML = '';
-                inp.value = '';
-                return;
+            if(state.dmTarget) {
+                // Send DM
+                state.ws.send(JSON.stringify({
+                    type: "dm",
+                    target_id: state.dmTarget.id,
+                    text: txt
+                }));
+            } else {
+                // Send Group Message
+                state.ws.send(JSON.stringify({
+                    type: "message",
+                    text: txt
+                }));
             }
-            
-            let style = "normal";
-            let finalText = txt;
-            
-            if(txt.startsWith('/shout ')) {
-                style = "shout";
-                finalText = txt.replace('/shout ', '');
-            }
-
-            state.ws.send(JSON.stringify({
-                type: "message",
-                text: finalText,
-                style: style
-            }));
             inp.value = '';
         }
 
-        // Typing logic
-        document.getElementById('msg-input').addEventListener('input', () => {
-            if(!typingTimeout) {
-                state.ws.send(JSON.stringify({type:"typing"}));
-                typingTimeout = setTimeout(() => typingTimeout = null, 2000);
-            }
-        });
-        document.getElementById('msg-input').addEventListener('keydown', e => {
-            if(e.key === 'Enter') sendMessage();
-        });
-
-        function showTyping(name) {
-            const el = document.getElementById('typing-indicator');
-            el.innerText = `${name} is typing...`;
-            el.style.opacity = 1;
-            setTimeout(() => el.style.opacity = 0, 2000);
-        }
-
-        function updatePresence(d) {
-            document.getElementById('presence-count').innerText = `${d.count} Users Connected`;
-        }
+        document.getElementById('msg-input').addEventListener('keydown', e => { if(e.key === 'Enter') sendMessage(); });
 
         async function handleFile() {
             const f = document.getElementById('file-input').files[0];
             if(!f) return;
             const fd = new FormData(); fd.append('file', f);
-            // Upload then send message with img url
             try {
                 const r = await fetch('/api/upload', {method:'POST', body:fd});
                 const res = await r.json();
                 state.ws.send(JSON.stringify({
-                    type: "message",
+                    type: state.dmTarget ? "dm" : "message",
+                    target_id: state.dmTarget?.id,
                     text: "",
                     image_url: res.url
                 }));
             } catch(e){}
         }
 
+        function updateUsers(users) {
+            state.users = users;
+        }
+
         // ==========================================
-        //   VOICE CHAT (MESH)
+        //   ROBUST VOICE CHAT (MESH FIX)
         // ==========================================
         let peer = null;
         let myStream = null;
-        let joinedVc = false;
-        let audioCtx, analyser, dataArray;
-        let vizInterval;
         let calls = {};
+        let inVc = false;
 
         async function joinVoice() {
             try {
-                myStream = await navigator.mediaDevices.getUserMedia({audio: true});
+                myStream = await navigator.mediaDevices.getUserMedia({audio: true, video: false});
             } catch(e) {
-                alert("Microphone Access Denied");
+                alert("Microphone Access Required");
                 return;
             }
-            
-            joinedVc = true;
+
+            inVc = true;
             document.getElementById('vc-panel').style.display = 'flex';
-            document.getElementById('vc-badge').style.display = 'inline-block';
+            document.getElementById('vc-badge').style.display = 'block';
             document.getElementById('join-vc-btn').style.display = 'none';
 
-            // Init Visualizer
-            initAudioViz();
-
-            // Init Peer
             peer = new Peer(state.uid);
             
-            peer.on('open', (id) => {
-                // Announce
+            peer.on('open', () => {
+                // Tell others I joined
                 state.ws.send(JSON.stringify({type: "vc_join"}));
-                // Add self
-                addVcUser(state.uid, state.user, state.pfp);
+                addVcSlot(state.uid, state.user, state.pfp);
             });
 
             peer.on('call', call => {
                 call.answer(myStream);
+                calls[call.peer] = call;
                 handleStream(call);
             });
         }
 
-        function handleVcJoin(d) {
-            if(!joinedVc) return;
-            addVcUser(d.sender_id, d.user_name, d.user_pfp);
-            // Connect to them
-            if(d.sender_id !== state.uid) {
-                const call = peer.call(d.sender_id, myStream);
-                handleStream(call);
+        function handleVcSignal(d) {
+            if(!inVc) return;
+            
+            if(d.subtype === "vc_leave") {
+                removeVcUser(d.sender_id);
+                return;
             }
-        }
-        
-        function handleVcLeave(d) {
-            const el = document.getElementById(`vc-u-${d.sender_id}`);
-            if(el) el.remove();
-            if(calls[d.sender_id]) calls[d.sender_id].close();
+
+            if(d.type === "vc_join") {
+                addVcSlot(d.sender_id, d.user_name, d.user_pfp);
+                if(d.sender_id !== state.uid) {
+                    const call = peer.call(d.sender_id, myStream);
+                    calls[d.sender_id] = call;
+                    handleStream(call);
+                }
+            }
+
+            if(d.type === "vc_talking") {
+                const el = document.getElementById(`vc-u-${d.sender_id}`);
+                if(el) {
+                    el.classList.add('talking');
+                    setTimeout(()=>el.classList.remove('talking'), 200);
+                }
+            }
         }
 
         function handleStream(call) {
-            calls[call.peer] = call;
             call.on('stream', remoteStream => {
-                let aud = document.createElement('audio');
+                if(document.getElementById(`aud-${call.peer}`)) return;
+                const aud = document.createElement('audio');
+                aud.id = `aud-${call.peer}`;
                 aud.srcObject = remoteStream;
                 aud.autoplay = true;
+                aud.playsInline = true; // Fix for iOS
                 document.getElementById('audio-container').appendChild(aud);
             });
+            call.on('close', () => removeVcUser(call.peer));
         }
 
-        function addVcUser(uid, name, pfp) {
+        function addVcSlot(uid, name, pfp) {
             if(document.getElementById(`vc-u-${uid}`)) return;
-            const grid = document.getElementById('vc-grid');
-            const div = document.createElement('div');
-            div.className = 'vc-slot';
-            div.id = `vc-u-${uid}`;
-            div.innerHTML = `<img src="${pfp}"><span>${name}</span>`;
-            grid.appendChild(div);
+            const d = document.createElement('div');
+            d.className = 'vc-slot';
+            d.id = `vc-u-${uid}`;
+            d.innerHTML = `<img src="${pfp}"><span>${name.substr(0,6)}</span>`;
+            document.getElementById('vc-grid').appendChild(d);
+        }
+
+        function removeVcUser(uid) {
+            const el = document.getElementById(`vc-u-${uid}`);
+            if(el) el.remove();
+            const aud = document.getElementById(`aud-${uid}`);
+            if(aud) aud.remove();
+            if(calls[uid]) { calls[uid].close(); delete calls[uid]; }
         }
 
         function leaveVoice() {
-            if(!joinedVc) return;
-            joinedVc = false;
+            if(!inVc) return;
+            inVc = false;
+            
+            // 1. Send signal
             state.ws.send(JSON.stringify({type: "vc_leave"}));
+            
+            // 2. Hard Cleanup
             if(peer) peer.destroy();
-            if(myStream) myStream.getTracks().forEach(t=>t.stop());
-            if(audioCtx) audioCtx.close();
+            if(myStream) myStream.getTracks().forEach(t => t.stop());
             
             document.getElementById('vc-panel').style.display = 'none';
             document.getElementById('vc-badge').style.display = 'none';
             document.getElementById('join-vc-btn').style.display = 'flex';
             document.getElementById('vc-grid').innerHTML = '';
             document.getElementById('audio-container').innerHTML = '';
+            calls = {};
         }
 
         let isMuted = false;
@@ -1013,114 +998,33 @@ html_content = """
             document.getElementById('mute-btn').style.opacity = isMuted ? 0.5 : 1;
         }
 
-        // --- VISUALIZER & TALKING DETECTION ---
-        function initAudioViz() {
-            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            const src = audioCtx.createMediaStreamSource(myStream);
-            analyser = audioCtx.createAnalyser();
-            analyser.fftSize = 64;
-            src.connect(analyser);
-            
-            const canvas = document.getElementById('viz-canvas');
-            const ctx = canvas.getContext('2d');
-            const bufferLength = analyser.frequencyBinCount;
-            const dataArray = new Uint8Array(bufferLength);
-            
-            function draw() {
-                if(!joinedVc) return;
-                requestAnimationFrame(draw);
-                analyser.getByteFrequencyData(dataArray);
-                
-                // Talking detection
-                let sum = 0;
-                for(let i=0; i<bufferLength; i++) sum += dataArray[i];
-                let avg = sum / bufferLength;
-                if(avg > 15 && !isMuted) {
-                    state.ws.send(JSON.stringify({type:"vc_talking", vol: avg}));
-                    highlightSpeaker(state.uid, avg);
-                }
-
-                // Canvas Draw
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
-                const barWidth = (canvas.width / bufferLength) * 2.5;
-                let barHeight;
-                let x = 0;
-
-                for(let i = 0; i < bufferLength; i++) {
-                    barHeight = dataArray[i] / 2;
-                    ctx.fillStyle = `rgb(${barHeight + 100}, 0, 255)`;
-                    ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
-                    x += barWidth + 1;
-                }
-            }
-            draw();
-        }
-
-        function highlightSpeaker(uid, vol) {
-            const el = document.getElementById(`vc-u-${uid}`);
-            if(el) {
-                el.classList.add('talking');
-                clearTimeout(el.talkTimeout);
-                el.talkTimeout = setTimeout(() => el.classList.remove('talking'), 200);
-            }
-        }
-
-        // ==========================================
-        //   CANVAS BACKGROUND (INFRASTRUCTURE)
-        // ==========================================
+        // --- BACKGROUND ---
         function initBackground() {
             const canvas = document.getElementById('infra-canvas');
             const ctx = canvas.getContext('2d');
-            let width, height;
-            let nodes = [];
-
-            function resize() {
-                width = canvas.width = window.innerWidth;
-                height = canvas.height = window.innerHeight;
-            }
-            window.onresize = resize;
+            let w, h, nodes = [];
+            
+            function resize() { w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; }
+            window.addEventListener('resize', resize);
             resize();
 
-            // Node Class
             class Node {
-                constructor() {
-                    this.x = Math.random() * width;
-                    this.y = Math.random() * height;
-                    this.vx = (Math.random() - 0.5) * 0.5;
-                    this.vy = (Math.random() - 0.5) * 0.5;
-                }
-                update() {
-                    this.x += this.vx; this.y += this.vy;
-                    if(this.x < 0 || this.x > width) this.vx *= -1;
-                    if(this.y < 0 || this.y > height) this.vy *= -1;
-                }
+                constructor() { this.x=Math.random()*w; this.y=Math.random()*h; this.vx=(Math.random()-.5); this.vy=(Math.random()-.5); }
+                update() { this.x+=this.vx; this.y+=this.vy; if(this.x<0||this.x>w)this.vx*=-1; if(this.y<0||this.y>h)this.vy*=-1; }
             }
-
-            for(let i=0; i<40; i++) nodes.push(new Node());
+            for(let i=0;i<30;i++) nodes.push(new Node());
 
             function animate() {
-                ctx.clearRect(0, 0, width, height);
-                ctx.lineWidth = 1;
-                
+                ctx.clearRect(0,0,w,h);
+                ctx.fillStyle = '#7000ff';
                 for(let i=0; i<nodes.length; i++) {
                     nodes[i].update();
-                    // Draw Node
-                    ctx.beginPath();
-                    ctx.arc(nodes[i].x, nodes[i].y, 2, 0, Math.PI*2);
-                    ctx.fillStyle = '#7000ff';
-                    ctx.fill();
-
-                    // Connections
+                    ctx.beginPath(); ctx.arc(nodes[i].x, nodes[i].y, 2, 0, Math.PI*2); ctx.fill();
                     for(let j=i+1; j<nodes.length; j++) {
-                        let dx = nodes[i].x - nodes[j].x;
-                        let dy = nodes[i].y - nodes[j].y;
-                        let dist = Math.sqrt(dx*dx + dy*dy);
-                        if(dist < 150) {
-                            ctx.beginPath();
-                            ctx.moveTo(nodes[i].x, nodes[i].y);
-                            ctx.lineTo(nodes[j].x, nodes[j].y);
-                            ctx.strokeStyle = `rgba(112, 0, 255, ${1 - dist/150})`;
-                            ctx.stroke();
+                        let d = Math.hypot(nodes[i].x-nodes[j].x, nodes[i].y-nodes[j].y);
+                        if(d<150) {
+                            ctx.beginPath(); ctx.moveTo(nodes[i].x,nodes[i].y); ctx.lineTo(nodes[j].x,nodes[j].y);
+                            ctx.strokeStyle=`rgba(112,0,255,${1-d/150})`; ctx.stroke();
                         }
                     }
                 }
@@ -1128,7 +1032,6 @@ html_content = """
             }
             animate();
         }
-
     </script>
 </body>
 </html>
