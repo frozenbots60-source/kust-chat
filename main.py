@@ -11,13 +11,13 @@ from redis import asyncio as aioredis
 from botocore.config import Config
 
 # ==========================================
-# KUSTIFY HYPER-X | V9.3 (VC FIXED: DISCOVERY + DUPE PREVENTION)
+# KUSTIFY HYPER-X | V9.4 (VC FIX + METADATA SYNC)
 # ==========================================
 
 app = FastAPI(
     title="Kustify Hyper-X API", 
     description="Next-Gen Infrastructure Chat API for Bots and Custom Clients", 
-    version="9.3",
+    version="9.4",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -232,9 +232,10 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
                         await redis.publish(GLOBAL_CHANNEL, json.dumps({"type": "delete_message", "group_id": group_id, "id": msg_id}))
                         break
             
-            # --- Voice Chat Signaling (Updated for State Sync) ---
-            elif mtype in ["vc_join", "vc_leave", "vc_signal", "vc_ping", "vc_request_state"]:
+            # --- Voice Chat Signaling ---
+            elif mtype in ["vc_join", "vc_leave", "vc_signal"]:
                 data.update({"sender_id": user_id, "group_id": group_id})
+                # Broadcast signals to group so peers can connect
                 await redis.publish(GLOBAL_CHANNEL, json.dumps({**data, "type": "vc_signal_group"}))
 
     except WebSocketDisconnect:
@@ -391,7 +392,7 @@ html_content = """
 
     <div id="sidebar">
         <div class="brand-area">
-            <span>HYPER-X v9.3</span>
+            <span>HYPER-X v9.4</span>
             <button class="btn-icon" onclick="openCreateModal()">+</button>
         </div>
         <div class="nav-list" id="group-list"></div>
@@ -661,20 +662,21 @@ html_content = """
                 document.getElementById('vc-panel').style.display = 'flex';
                 document.getElementById('btn-join-vc').style.display = 'none';
                 
+                // Add Self to Grid
                 addVCUser(id, state.user, state.pfp, true);
 
                 navigator.mediaDevices.getUserMedia({audio: true, video: false}).then(stream => {
                     state.localStream = stream;
-                    setupAudioVisualizer(stream, id);
+                    setupAudioVisualizer(stream, id); // Animate Self
                     
-                    // 1. Join the room
                     state.ws.send(JSON.stringify({type: "vc_join", peer_id: id, name: state.user, pfp: state.pfp}));
                     
-                    // 2. Announce presence & ask who is here (FIX FOR NEW USER DISCOVERY)
-                    state.ws.send(JSON.stringify({type: "vc_request_state", peer_id: id}));
-
                     state.peer.on('call', call => {
                         call.answer(stream);
+                        // FIX: When receiving a call, read metadata to identify the existing user
+                        if(call.metadata) {
+                            addVCUser(call.peer, call.metadata.name, call.metadata.pfp);
+                        }
                         handleStream(call);
                     });
                 }).catch(e => { alert("Mic Access Denied"); leaveVC(); });
@@ -702,32 +704,27 @@ html_content = """
         function handleVCSignal(d) {
             if(!state.inVC || d.sender_id === state.uid) return;
             
-            // --- FIX: Respond to State Request (If I am here, I tell the new user) ---
-            if(d.type === "vc_signal_group" && (d.vc_type === "request_state" || d.type === "vc_request_state")) {
-                state.ws.send(JSON.stringify({type: "vc_join", peer_id: state.myPeerId, name: state.user, pfp: state.pfp}));
-                return;
-            }
-
-            // Someone joined or pinged - Add them and CALL them if they are new
-            if(d.peer_id && (d.type === "vc_signal_group" || d.type === "vc_join" || d.type === "vc_ping") && d.name) { 
+            // New User Joined
+            if(d.peer_id && d.type === "vc_signal_group" && d.name) { 
                 if(!state.vcUsers[d.peer_id]) {
                     addVCUser(d.peer_id, d.name, d.pfp);
-                    // Initiate the call to the new user so voice connects
-                    if(!state.vcCalls[d.peer_id]) {
-                        const call = state.peer.call(d.peer_id, state.localStream);
-                        handleStream(call);
-                    }
+                    // FIX: Pass MY info (metadata) to the new user so they can see me
+                    const call = state.peer.call(d.peer_id, state.localStream, {
+                        metadata: {name: state.user, pfp: state.pfp}
+                    });
+                    handleStream(call);
                 }
             }
             
             if(d.type === "vc_signal_group" && d.vc_type === "leave") { 
-                removeVCUser(d.peer_id);
+               // Cleanup handled by stream close
             }
         }
 
         function handleStream(call) {
             state.vcCalls[call.peer] = call;
             call.on('stream', remoteStream => {
+                // Check if video (screen share)
                 const hasVideo = remoteStream.getVideoTracks().length > 0;
                 
                 if(hasVideo) {
@@ -738,7 +735,7 @@ html_content = """
                     const audio = document.createElement('audio');
                     audio.srcObject = remoteStream;
                     audio.play();
-                    setupAudioVisualizer(remoteStream, call.peer);
+                    setupAudioVisualizer(remoteStream, call.peer); // Animate Remote
                 }
             });
             call.on('close', () => { 
@@ -748,16 +745,13 @@ html_content = """
         }
 
         function addVCUser(id, name, pfp, isMe=false) {
-            // --- FIX: Strict Duplicate Check ---
-            if(document.getElementById(`vc-u-${id}`)) return;
-            
+            if(state.vcUsers[id]) return;
             const grid = document.getElementById('vc-users-grid');
             const div = document.createElement('div');
             div.className = 'vc-user';
             div.id = `vc-u-${id}`;
-            const pfpUrl = pfp || `https://api.dicebear.com/7.x/identicon/svg?seed=${id}`;
             div.innerHTML = `
-                <img src="${pfpUrl}" class="vc-avatar" id="avatar-${id}">
+                <img src="${pfp}" class="vc-avatar" id="avatar-${id}">
                 <span class="vc-name">${name}${isMe ? ' (You)' : ''}</span>
             `;
             grid.appendChild(div);
@@ -768,7 +762,6 @@ html_content = """
             const u = document.getElementById(`vc-u-${id}`);
             if(u) u.remove();
             delete state.vcUsers[id];
-            if(state.vcCalls[id]) delete state.vcCalls[id];
         }
 
         // --- VISUAL ANIMATION ---
@@ -783,25 +776,32 @@ html_content = """
                 const bufferLength = analyser.frequencyBinCount;
                 const dataArray = new Uint8Array(bufferLength);
                 
+                const avatar = document.getElementById(`avatar-${id}`);
+                
                 function animate() {
-                    const avatar = document.getElementById(`avatar-${id}`);
-                    if(!state.inVC || !avatar) return;
+                    if(!state.inVC || !document.getElementById(`avatar-${id}`)) return;
                     requestAnimationFrame(animate);
                     analyser.getByteFrequencyData(dataArray);
                     
+                    // Simple average volume
                     let sum = 0; 
                     for(let i=0; i<bufferLength; i++) sum += dataArray[i];
                     const avg = sum / bufferLength;
                     
-                    if(avg > 10) { 
-                        const scale = 1 + (avg / 200);
-                        avatar.style.transform = `scale(${scale})`;
-                        avatar.style.boxShadow = `0 0 0 ${avg/10}px var(--primary)`;
-                        avatar.style.borderColor = 'var(--accent)';
+                    if(avg > 10) { // Threshold
+                        const scale = 1 + (avg / 200); // Scale up to ~1.5x
+                        const glow = `0 0 0 ${avg/10}px var(--primary)`;
+                        if(avatar) {
+                            avatar.style.transform = `scale(${scale})`;
+                            avatar.style.boxShadow = glow;
+                            avatar.style.borderColor = 'var(--accent)';
+                        }
                     } else {
-                        avatar.style.transform = 'scale(1)';
-                        avatar.style.boxShadow = 'none';
-                        avatar.style.borderColor = '#333';
+                        if(avatar) {
+                            avatar.style.transform = 'scale(1)';
+                            avatar.style.boxShadow = 'none';
+                            avatar.style.borderColor = '#333';
+                        }
                     }
                 }
                 animate();
@@ -814,30 +814,36 @@ html_content = """
             const btn = document.getElementById('btn-share');
             
             if(state.isSharing) {
+                // Stop Sharing - Revert to Mic
                 state.isSharing = false;
                 btn.classList.remove('active');
+                
+                // Switch tracks back
                 const audioTrack = state.localStream.getAudioTracks()[0];
                 for (let peerId in state.vcCalls) {
-                    const senders = state.vcCalls[peerId].peerConnection.getSenders();
-                    const sender = senders.find(s => s.track && (s.track.kind === 'video' || s.track.kind === 'audio'));
+                    const sender = state.vcCalls[peerId].peerConnection.getSenders().find(s => s.track.kind === 'video' || s.track.kind === 'audio');
                     if(sender) sender.replaceTrack(audioTrack);
                 }
+                
                 return;
             }
 
             try {
                 const screenStream = await navigator.mediaDevices.getDisplayMedia({video: true, audio: true});
                 const screenTrack = screenStream.getVideoTracks()[0];
+                
                 state.isSharing = true;
                 btn.classList.add('active');
                 
+                // Handle user clicking "Stop Sharing" in browser UI
                 screenTrack.onended = () => { if(state.isSharing) toggleScreenShare(); };
 
+                // Replace tracks in active calls
                 for (let peerId in state.vcCalls) {
-                    const senders = state.vcCalls[peerId].peerConnection.getSenders();
-                    const sender = senders.find(s => s.track && s.track.kind === 'audio'); 
+                    const sender = state.vcCalls[peerId].peerConnection.getSenders().find(s => s.track.kind === 'audio'); 
                     if(sender) sender.replaceTrack(screenTrack);
                 }
+                
             } catch(e) { console.error(e); state.isSharing = false; }
         }
 
@@ -859,3 +865,4 @@ html_content = """
     </script>
 </body>
 </html>
+"""
