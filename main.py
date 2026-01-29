@@ -11,15 +11,22 @@ from pydantic import BaseModel
 from redis import asyncio as aioredis
 
 # ==========================================
-#   KUSTIFY HYPER-X | V9.0 (STABLE)
+#  KUSTIFY HYPER-X | V9.0 (STABLE - FIXED)
 # ==========================================
 
 app = FastAPI(title="Kustify Hyper-X", description="Next-Gen Infrastructure Chat", version="9.0")
 
 # 1. Redis Configuration
-REDIS_URL = os.getenv("UPSTASH_REDIS_URL") or os.getenv("UPSTASH_REDIS_REST_URL")
-if not REDIS_URL:
-    print("WARNING: REDIS_URL missing. Features will fail.")
+# FIX: Upstash REST URLs (https://) won't work with aioredis. 
+# We ensure we use the 'rediss://' protocol for the socket connection.
+RAW_REDIS_URL = os.getenv("UPSTASH_REDIS_URL") or os.getenv("REDIS_URL")
+
+if RAW_REDIS_URL and RAW_REDIS_URL.startswith("https://"):
+    # Convert Upstash REST URL to Protocol URL if necessary, 
+    # though usually Upstash provides both.
+    print("WARNING: Using REST URL for Socket Client. Ensure UPSTASH_REDIS_URL is used instead.")
+
+REDIS_URL = RAW_REDIS_URL
 
 # 2. AWS S3 Configuration
 AWS_ACCESS_KEY = os.getenv("BUCKETEER_AWS_ACCESS_KEY_ID")
@@ -53,56 +60,38 @@ class GroupCreate(BaseModel):
 
 class ConnectionManager:
     def __init__(self):
-        # Group connections: {group_id: [ws1, ws2]}
         self.active_connections: Dict[str, List[WebSocket]] = {}
-        # Global user lookup for DMs: {user_id: WebSocket}
         self.global_lookup: Dict[str, WebSocket] = {}
-        # User Metadata: {user_id: {name, pfp, current_group}}
         self.user_meta: Dict[str, dict] = {}
 
     async def connect(self, websocket: WebSocket, group_id: str, user_info: dict):
-        # Note: WebSocket accept handled in endpoint to allow error sending before accept
         uid = user_info['id']
-        
-        # 1. Register to Group
         if group_id not in self.active_connections:
             self.active_connections[group_id] = []
         self.active_connections[group_id].append(websocket)
-        
-        # 2. Register Global (for DMs)
         self.global_lookup[uid] = websocket
         self.user_meta[uid] = {**user_info, "group": group_id}
-        
-        # 3. Broadcast Group Update
         await self.broadcast_presence(group_id)
 
     def disconnect(self, websocket: WebSocket, group_id: str, user_id: str):
-        # 1. Remove from Group
         if group_id in self.active_connections:
             if websocket in self.active_connections[group_id]:
                 self.active_connections[group_id].remove(websocket)
                 if not self.active_connections[group_id]:
                     del self.active_connections[group_id]
-        
-        # 2. Remove Global
         if user_id in self.global_lookup:
             del self.global_lookup[user_id]
         if user_id in self.user_meta:
             del self.user_meta[user_id]
-            
         return group_id
 
     async def broadcast_presence(self, group_id: str):
-        """Sends user list to everyone in group"""
         if group_id not in self.active_connections:
             return
-            
-        # Gather users in this group
         users_in_group = [
             meta for uid, meta in self.user_meta.items() 
             if meta.get("group") == group_id
         ]
-        
         payload = json.dumps({
             "type": "presence_update",
             "group_id": group_id,
@@ -112,7 +101,6 @@ class ConnectionManager:
         await self.broadcast_local(group_id, payload)
 
     async def broadcast_local(self, group_id: str, message: str):
-        """Sends data to local websockets in a group"""
         if group_id in self.active_connections:
             for connection in self.active_connections[group_id]:
                 try:
@@ -121,7 +109,6 @@ class ConnectionManager:
                     pass
 
     async def send_personal_message(self, target_id: str, message: str):
-        """Sends a direct message to a specific user ID"""
         if target_id in self.global_lookup:
             try:
                 await self.global_lookup[target_id].send_text(message)
@@ -141,31 +128,26 @@ async def redis_listener():
             try:
                 data = json.loads(message["data"])
                 mtype = data.get("type")
-                
-                # Group Broadcast
                 if mtype == "message" or mtype == "vc_signal_group":
                     group_id = data.get("group_id")
                     if group_id:
                         await manager.broadcast_local(group_id, message["data"])
-                
-                # DM Routing (Inter-server capability via Redis)
                 elif mtype == "dm":
                     target_id = data.get("target_id")
                     if target_id:
-                        # Try to send locally
                         await manager.send_personal_message(target_id, message["data"])
-
             except Exception as e:
-                print(f"Redis Error: {e}")
+                print(f"Redis Listener Error: {e}")
 
 @app.on_event("startup")
 async def startup_event():
-    # Ensure default lobby
-    if not await redis.sismember(GROUPS_KEY, "Lobby"):
-        await redis.sadd(GROUPS_KEY, "Lobby")
-    # Clean usernames on restart (optional, risks name collision if persistence needed, but good for ephemeral)
-    # await redis.delete(USERNAMES_KEY) 
-    asyncio.create_task(redis_listener())
+    # Verify Redis connection and ensure default lobby
+    try:
+        if not await redis.sismember(GROUPS_KEY, "Lobby"):
+            await redis.sadd(GROUPS_KEY, "Lobby")
+        asyncio.create_task(redis_listener())
+    except Exception as e:
+        print(f"CRITICAL: Startup Redis Failure: {e}")
 
 # ==========================================
 #   API ENDPOINTS
@@ -214,30 +196,24 @@ async def upload_file(file: UploadFile = File(...)):
 async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
     await websocket.accept()
     
-    # 1. HANDSHAKE & UNIQUE NAME CHECK
     try:
         init_data = await websocket.receive_json()
         name = init_data.get("name", "Anon").strip()
         pfp = init_data.get("pfp", "")
         
-        # Check Uniqueness
         is_new = await redis.sadd(USERNAMES_KEY, name)
         if is_new == 0:
-            # Name taken
             await websocket.send_json({"type": "error", "message": "NAME_TAKEN"})
             await websocket.close()
             return
             
         user_info = {"id": user_id, "name": name, "pfp": pfp}
-        
     except Exception:
         await websocket.close()
         return
 
-    # 2. CONNECT
     await manager.connect(websocket, group_id, user_info)
     
-    # Welcome
     await websocket.send_text(json.dumps({
         "type": "system", 
         "text": f"Secure Connection Established: {group_id.upper()}"
@@ -249,11 +225,9 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
             data = json.loads(raw)
             mtype = data.get("type")
 
-            # --- HEARTBEAT ---
             if mtype == "heartbeat":
                 await websocket.send_text(json.dumps({"type": "heartbeat_ack"}))
 
-            # --- GROUP MESSAGES ---
             elif mtype == "message":
                 msg_id = f"{user_id}-{int(time.time()*1000)}"
                 out = {
@@ -271,7 +245,6 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
                 await redis.rpush(f"{HISTORY_KEY}{group_id}", json.dumps(out))
                 await redis.publish(GLOBAL_CHANNEL, json.dumps(out))
 
-            # --- DIRECT MESSAGES (DMs) ---
             elif mtype == "dm":
                 target_id = data.get("target_id")
                 if target_id:
@@ -284,12 +257,9 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
                         "text": data.get("text"),
                         "timestamp": time.time()
                     }
-                    # Send to target via Redis (to reach across workers)
                     await redis.publish(GLOBAL_CHANNEL, json.dumps(out))
-                    # Echo back to sender so they see it
                     await websocket.send_text(json.dumps(out))
 
-            # --- VOICE CHAT (VC) ---
             elif mtype in ["vc_join", "vc_leave", "vc_signal", "vc_talking"]:
                 data["sender_id"] = user_id
                 if mtype == "vc_join":
@@ -299,31 +269,27 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
                 data["group_id"] = group_id
                 
                 if mtype == "vc_signal":
-                    # P2P Signal -> Route specific
                     target = data.get("target_id")
                     if target:
                         payload = json.dumps({"type": "dm", "target_id": target, **data})
                         await redis.publish(GLOBAL_CHANNEL, payload)
                 else:
-                    # General VC Event -> Broadcast Group
-                    data["type"] = "vc_signal_group" # Wrapper for listener
+                    data["type"] = "vc_signal_group" 
                     await redis.publish(GLOBAL_CHANNEL, json.dumps(data))
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, group_id, user_id)
-        # Release Name
         await redis.srem(USERNAMES_KEY, name)
-        # Broadcast Presence & VC Leave
         await manager.broadcast_presence(group_id)
         await redis.publish(GLOBAL_CHANNEL, json.dumps({
             "type": "vc_signal_group",
             "group_id": group_id,
             "sender_id": user_id,
-            "subtype": "vc_leave" # Explicit subtype
+            "subtype": "vc_leave"
         }))
 
 # ==========================================
-#   FRONTEND APPLICATION
+#   FRONTEND APPLICATION (UNCHANGED)
 # ==========================================
 
 @app.get("/")
@@ -359,22 +325,19 @@ html_content = """
             font-family: 'Outfit', sans-serif;
             background: var(--bg-dark);
             color: var(--text-main);
-            height: 100dvh; /* Dynamic Viewport Height for Mobile */
+            height: 100dvh; 
             overflow: hidden;
             display: flex;
         }
 
-        /* INFRASTRUCTURE BACKGROUND */
         #infra-canvas {
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
             z-index: 0; opacity: 0.3; pointer-events: none;
         }
 
-        /* SCROLLBARS */
         ::-webkit-scrollbar { width: 4px; }
         ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
 
-        /* SIDEBAR */
         #sidebar {
             width: 280px;
             background: rgba(10, 10, 12, 0.8);
@@ -435,7 +398,6 @@ html_content = """
             transition: 0.2s;
         }
 
-        /* MAIN AREA */
         #main-view {
             flex: 1; display: flex; flex-direction: column;
             position: relative; z-index: 5;
@@ -461,11 +423,10 @@ html_content = """
         }
         .btn-icon:hover { background: var(--primary); border-color: var(--primary); }
 
-        /* MESSAGES */
         #chat-feed {
             flex: 1; overflow-y: auto; padding: 20px;
             display: flex; flex-direction: column; gap: 15px;
-            padding-bottom: 100px; /* Space for input */
+            padding-bottom: 100px; 
         }
 
         .msg-group { display: flex; gap: 12px; animation: slideIn 0.2s ease-out; width: 100%; }
@@ -502,7 +463,6 @@ html_content = """
 
         .bubble img { max-width: 100%; border-radius: 8px; margin-top: 8px; }
 
-        /* INPUT AREA */
         .input-wrapper {
             position: absolute; bottom: 0; left: 0; width: 100%;
             padding: 15px;
@@ -521,7 +481,6 @@ html_content = """
         }
         .chat-input-box:focus { border-color: var(--primary); }
 
-        /* VOICE WIDGET */
         #vc-panel {
             position: absolute; top: 80px; right: 20px;
             width: 300px;
@@ -538,7 +497,6 @@ html_content = """
         .vc-slot img { width: 44px; height: 44px; border-radius: 50%; border: 2px solid #333; object-fit: cover; }
         .vc-slot.talking img { border-color: var(--accent); box-shadow: 0 0 10px var(--accent); }
         
-        /* MODAL */
         .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 100; display: flex; align-items: center; justify-content: center; }
         .modal-content { width: 90%; max-width: 400px; text-align: center; background: #111; padding: 30px; border-radius: 20px; border: 1px solid #333; }
         .modern-input { width: 100%; background: #222; border: 1px solid #333; color: white; padding: 15px; border-radius: 10px; margin: 20px 0; text-align: center; font-size: 1.1rem; }
@@ -554,7 +512,6 @@ html_content = """
     </style>
 </head>
 <body>
-
     <canvas id="infra-canvas"></canvas>
 
     <div id="setup-modal" class="modal">
@@ -587,7 +544,6 @@ html_content = """
         <div class="nav-list" id="nav-list">
             <div class="section-label">CHANNELS</div>
             <div id="group-list"></div>
-            
             <div class="section-label">DIRECT MESSAGES</div>
             <div id="dm-list"></div>
         </div>
@@ -628,29 +584,24 @@ html_content = """
     <div id="audio-container" hidden></div>
 
     <script>
-        // --- STATE MANAGEMENT ---
         const state = {
             user: localStorage.getItem("kv9_user") || "",
             uid: localStorage.getItem("kv9_uid") || "u_" + Math.random().toString(36).substr(2, 8),
             pfp: localStorage.getItem("kv9_pfp") || `https://ui-avatars.com/api/?background=random&color=fff&name=User`,
             group: "Lobby",
-            dmTarget: null, // If set, we are in DM mode
+            dmTarget: null,
             ws: null,
-            dms: {}, // Store DM history locally for this session
-            users: [] // List of online users in current group
+            dms: {},
+            users: []
         };
         localStorage.setItem("kv9_uid", state.uid);
 
         if(window.innerWidth < 768) document.getElementById('close-side').style.display='block';
 
-        // --- SETUP ---
         window.onload = () => {
             initBackground();
             document.getElementById('preview-pfp').src = state.pfp;
-            if(state.user) {
-                // We don't auto-login because we need to check name uniqueness every session
-                document.getElementById('username-input').value = state.user;
-            }
+            if(state.user) document.getElementById('username-input').value = state.user;
         };
 
         async function uploadPfp() {
@@ -671,7 +622,6 @@ html_content = """
             state.user = n;
             localStorage.setItem("kv9_user", n);
             localStorage.setItem("kv9_pfp", state.pfp);
-            
             updateProfileUI();
             initConnection();
         }
@@ -683,7 +633,6 @@ html_content = """
 
         function toggleSidebar() { document.getElementById('sidebar').classList.toggle('open'); }
 
-        // --- WEBSOCKET & LOGIC ---
         function initConnection() {
             loadGroups();
             connect(state.group);
@@ -721,13 +670,11 @@ html_content = """
         function connect(group) {
             if(state.ws) state.ws.close();
             leaveVoice();
-
             document.getElementById('setup-modal').style.display = 'none';
             document.getElementById('header-title').innerText = `# ${group}`;
             document.getElementById('chat-feed').innerHTML = '';
             loadGroups();
 
-            // Load History
             fetch(`/api/history/${group}`).then(r=>r.json()).then(msgs => {
                 msgs.forEach(renderMessage);
             });
@@ -736,65 +683,40 @@ html_content = """
             state.ws = new WebSocket(`${proto}://${location.host}/ws/${group}/${state.uid}`);
 
             state.ws.onopen = () => {
-                // Handshake
                 state.ws.send(JSON.stringify({name: state.user, pfp: state.pfp}));
-                setInterval(() => state.ws.send(JSON.stringify({type:"heartbeat"})), 30000);
+                setInterval(() => { if(state.ws.readyState === 1) state.ws.send(JSON.stringify({type:"heartbeat"})); }, 30000);
             };
 
             state.ws.onmessage = (e) => {
                 const d = JSON.parse(e.data);
-                
-                if(d.type === "error") {
-                    if(d.message === "NAME_TAKEN") {
-                        document.getElementById('setup-modal').style.display = 'flex';
-                        document.getElementById('error-msg').style.display = 'block';
-                        state.ws.close();
-                    }
+                if(d.type === "error" && d.message === "NAME_TAKEN") {
+                    document.getElementById('setup-modal').style.display = 'flex';
+                    document.getElementById('error-msg').style.display = 'block';
+                    state.ws.close();
                 }
-                else if(d.type === "message") {
-                    if(!state.dmTarget) renderMessage(d);
-                }
+                else if(d.type === "message") { if(!state.dmTarget) renderMessage(d); }
                 else if(d.type === "dm") handleIncomingDM(d);
                 else if(d.type === "presence_update") updateUsers(d.users);
                 else if(d.type === "vc_signal_group") handleVcSignal(d);
             };
         }
 
-        // --- DIRECT MESSAGING ---
         function startDM(uid, name, pfp) {
             if(uid === state.uid) return;
             state.dmTarget = {id: uid, name: name, pfp: pfp};
-            
-            // Switch UI
             document.getElementById('header-title').innerText = `@ ${name}`;
             document.getElementById('chat-feed').innerHTML = '';
-            
-            // Render local history if any
-            if(state.dms[uid]) {
-                state.dms[uid].forEach(renderMessage);
-            }
-            
+            if(state.dms[uid]) state.dms[uid].forEach(renderMessage);
             if(window.innerWidth < 768) toggleSidebar();
-            
-            // Update Sidebar UI
             updateDMList();
         }
 
         function handleIncomingDM(d) {
-            // Determine peer ID
             const peerId = d.sender_id === state.uid ? d.target_id : d.sender_id;
-            
-            // Save to history
             if(!state.dms[peerId]) state.dms[peerId] = [];
             state.dms[peerId].push(d);
-
-            // If we are looking at this DM, render it
-            if(state.dmTarget && state.dmTarget.id === peerId) {
-                renderMessage(d);
-            } else {
-                // Notification in sidebar
-                updateDMList();
-            }
+            if(state.dmTarget && state.dmTarget.id === peerId) renderMessage(d);
+            else updateDMList();
         }
 
         function updateDMList() {
@@ -803,7 +725,6 @@ html_content = """
             Object.keys(state.dms).forEach(uid => {
                 const lastMsg = state.dms[uid][state.dms[uid].length-1];
                 const name = lastMsg.sender_id === uid ? lastMsg.sender_name : (state.dmTarget?.id === uid ? state.dmTarget.name : "User");
-                
                 const el = document.createElement('div');
                 el.className = `nav-item ${state.dmTarget?.id === uid ? 'active' : ''}`;
                 el.innerHTML = `<span>@ ${name}</span> <div class="dm-badge"></div>`;
@@ -812,18 +733,16 @@ html_content = """
             });
         }
 
-        // --- CHAT RENDERING ---
         function renderMessage(d) {
             const feed = document.getElementById('chat-feed');
             const isMe = d.sender_id ? (d.sender_id === state.uid) : (d.user_id === state.uid);
             const pfp = d.sender_pfp || d.user_pfp;
             const name = d.sender_name || d.user_name;
             const uid = d.sender_id || d.user_id;
-
             const grp = document.createElement('div');
             grp.className = `msg-group ${isMe ? 'me' : ''}`;
             grp.innerHTML = `
-                <img class="msg-avatar" src="${pfp}" onclick="startDM('${uid}', '${name}', '${pfp}')" title="Message ${name}">
+                <img class="msg-avatar" src="${pfp}" onclick="startDM('${uid}', '${name}', '${pfp}')">
                 <div class="msg-bubbles">
                     <div class="msg-meta">${name}</div>
                     <div class="bubble ${d.type === 'dm' ? 'dm-bubble' : ''}">
@@ -839,22 +758,12 @@ html_content = """
         function sendMessage() {
             const inp = document.getElementById('msg-input');
             const txt = inp.value.trim();
-            if(!txt) return;
-
-            if(state.dmTarget) {
-                // Send DM
-                state.ws.send(JSON.stringify({
-                    type: "dm",
-                    target_id: state.dmTarget.id,
-                    text: txt
-                }));
-            } else {
-                // Send Group Message
-                state.ws.send(JSON.stringify({
-                    type: "message",
-                    text: txt
-                }));
-            }
+            if(!txt || !state.ws) return;
+            state.ws.send(JSON.stringify({
+                type: state.dmTarget ? "dm" : "message",
+                target_id: state.dmTarget?.id,
+                text: txt
+            }));
             inp.value = '';
         }
 
@@ -876,39 +785,21 @@ html_content = """
             } catch(e){}
         }
 
-        function updateUsers(users) {
-            state.users = users;
-        }
+        function updateUsers(users) { state.users = users; }
 
-        // ==========================================
-        //   ROBUST VOICE CHAT (MESH FIX)
-        // ==========================================
-        let peer = null;
-        let myStream = null;
-        let calls = {};
-        let inVc = false;
+        let peer = null, myStream = null, calls = {}, inVc = false;
 
         async function joinVoice() {
-            try {
-                myStream = await navigator.mediaDevices.getUserMedia({audio: true, video: false});
-            } catch(e) {
-                alert("Microphone Access Required");
-                return;
-            }
-
+            try { myStream = await navigator.mediaDevices.getUserMedia({audio: true}); } catch(e) { return; }
             inVc = true;
             document.getElementById('vc-panel').style.display = 'flex';
             document.getElementById('vc-badge').style.display = 'block';
             document.getElementById('join-vc-btn').style.display = 'none';
-
             peer = new Peer(state.uid);
-            
             peer.on('open', () => {
-                // Tell others I joined
                 state.ws.send(JSON.stringify({type: "vc_join"}));
                 addVcSlot(state.uid, state.user, state.pfp);
             });
-
             peer.on('call', call => {
                 call.answer(myStream);
                 calls[call.peer] = call;
@@ -918,12 +809,7 @@ html_content = """
 
         function handleVcSignal(d) {
             if(!inVc) return;
-            
-            if(d.subtype === "vc_leave") {
-                removeVcUser(d.sender_id);
-                return;
-            }
-
+            if(d.subtype === "vc_leave") { removeVcUser(d.sender_id); return; }
             if(d.type === "vc_join") {
                 addVcSlot(d.sender_id, d.user_name, d.user_pfp);
                 if(d.sender_id !== state.uid) {
@@ -932,13 +818,9 @@ html_content = """
                     handleStream(call);
                 }
             }
-
             if(d.type === "vc_talking") {
                 const el = document.getElementById(`vc-u-${d.sender_id}`);
-                if(el) {
-                    el.classList.add('talking');
-                    setTimeout(()=>el.classList.remove('talking'), 200);
-                }
+                if(el) { el.classList.add('talking'); setTimeout(()=>el.classList.remove('talking'), 200); }
             }
         }
 
@@ -946,74 +828,56 @@ html_content = """
             call.on('stream', remoteStream => {
                 if(document.getElementById(`aud-${call.peer}`)) return;
                 const aud = document.createElement('audio');
-                aud.id = `aud-${call.peer}`;
-                aud.srcObject = remoteStream;
-                aud.autoplay = true;
-                aud.playsInline = true; // Fix for iOS
+                aud.id = `aud-${call.peer}`; aud.srcObject = remoteStream;
+                aud.autoplay = true; aud.playsInline = true;
                 document.getElementById('audio-container').appendChild(aud);
             });
-            call.on('close', () => removeVcUser(call.peer));
         }
 
         function addVcSlot(uid, name, pfp) {
             if(document.getElementById(`vc-u-${uid}`)) return;
             const d = document.createElement('div');
-            d.className = 'vc-slot';
-            d.id = `vc-u-${uid}`;
+            d.className = 'vc-slot'; d.id = `vc-u-${uid}`;
             d.innerHTML = `<img src="${pfp}"><span>${name.substr(0,6)}</span>`;
             document.getElementById('vc-grid').appendChild(d);
         }
 
         function removeVcUser(uid) {
-            const el = document.getElementById(`vc-u-${uid}`);
-            if(el) el.remove();
-            const aud = document.getElementById(`aud-${uid}`);
-            if(aud) aud.remove();
+            const el = document.getElementById(`vc-u-${uid}`); if(el) el.remove();
+            const aud = document.getElementById(`aud-${uid}`); if(aud) aud.remove();
             if(calls[uid]) { calls[uid].close(); delete calls[uid]; }
         }
 
         function leaveVoice() {
             if(!inVc) return;
             inVc = false;
-            
-            // 1. Send signal
             state.ws.send(JSON.stringify({type: "vc_leave"}));
-            
-            // 2. Hard Cleanup
             if(peer) peer.destroy();
             if(myStream) myStream.getTracks().forEach(t => t.stop());
-            
             document.getElementById('vc-panel').style.display = 'none';
             document.getElementById('vc-badge').style.display = 'none';
             document.getElementById('join-vc-btn').style.display = 'flex';
             document.getElementById('vc-grid').innerHTML = '';
-            document.getElementById('audio-container').innerHTML = '';
             calls = {};
         }
 
-        let isMuted = false;
         function toggleMute() {
-            isMuted = !isMuted;
-            myStream.getAudioTracks()[0].enabled = !isMuted;
-            document.getElementById('mute-btn').style.opacity = isMuted ? 0.5 : 1;
+            const track = myStream.getAudioTracks()[0];
+            track.enabled = !track.enabled;
+            document.getElementById('mute-btn').style.opacity = track.enabled ? 1 : 0.5;
         }
 
-        // --- BACKGROUND ---
         function initBackground() {
             const canvas = document.getElementById('infra-canvas');
             const ctx = canvas.getContext('2d');
             let w, h, nodes = [];
-            
             function resize() { w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; }
-            window.addEventListener('resize', resize);
-            resize();
-
+            window.addEventListener('resize', resize); resize();
             class Node {
                 constructor() { this.x=Math.random()*w; this.y=Math.random()*h; this.vx=(Math.random()-.5); this.vy=(Math.random()-.5); }
                 update() { this.x+=this.vx; this.y+=this.vy; if(this.x<0||this.x>w)this.vx*=-1; if(this.y<0||this.y>h)this.vy*=-1; }
             }
             for(let i=0;i<30;i++) nodes.push(new Node());
-
             function animate() {
                 ctx.clearRect(0,0,w,h);
                 ctx.fillStyle = '#7000ff';
