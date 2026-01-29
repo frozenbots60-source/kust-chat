@@ -233,9 +233,8 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
                         break
             
             # --- Voice Chat Signaling ---
-            elif mtype in ["vc_join", "vc_leave", "vc_signal"]:
+            elif mtype in ["vc_join", "vc_leave", "vc_signal", "vc_ping"]:
                 data.update({"sender_id": user_id, "group_id": group_id})
-                # Broadcast signals to group so peers can connect
                 await redis.publish(GLOBAL_CHANNEL, json.dumps({**data, "type": "vc_signal_group"}))
 
     except WebSocketDisconnect:
@@ -668,15 +667,12 @@ html_content = """
                     state.localStream = stream;
                     setupAudioVisualizer(stream, id);
                     
-                    // Notify others and request a sync so already joined users show up for us
-                    state.ws.send(JSON.stringify({
-                        type: "vc_join", 
-                        peer_id: id, 
-                        name: state.user, 
-                        pfp: state.pfp,
-                        request_sync: true 
-                    }));
+                    // 1. Join the room
+                    state.ws.send(JSON.stringify({type: "vc_join", peer_id: id, name: state.user, pfp: state.pfp}));
                     
+                    // 2. Announce presence so existing users can ping back
+                    state.ws.send(JSON.stringify({type: "vc_ping", peer_id: id, name: state.user, pfp: state.pfp}));
+
                     state.peer.on('call', call => {
                         call.answer(stream);
                         handleStream(call);
@@ -706,25 +702,23 @@ html_content = """
         function handleVCSignal(d) {
             if(!state.inVC || d.sender_id === state.uid) return;
             
-            // Case 1: A new user just joined (or an old user is replying to our join request)
-            if(d.peer_id && d.type === "vc_signal_group" && d.name) { 
+            // Someone pinged (they are new, we should call them) OR Someone joined
+            if(d.peer_id && (d.type === "vc_signal_group" || d.type === "vc_ping" || d.type === "vc_join") && d.name) { 
                 if(!state.vcUsers[d.peer_id]) {
                     addVCUser(d.peer_id, d.name, d.pfp);
-                    const call = state.peer.call(d.peer_id, state.localStream);
-                    handleStream(call);
                 }
                 
-                // Case 2: We just joined, and this person is already here. 
-                // If they sent request_sync, we must reply with our presence so they see us.
-                if(d.request_sync) {
-                    state.ws.send(JSON.stringify({
-                        type: "vc_join", 
-                        peer_id: state.myPeerId, 
-                        name: state.user, 
-                        pfp: state.pfp,
-                        request_sync: false 
-                    }));
+                // If it was a join or ping signal, we call them to establish bidirectional connection
+                if(d.type === "vc_signal_group" && (d.vc_type === "join" || d.type === "vc_join" || d.type === "vc_ping")) {
+                   if(!state.vcCalls[d.peer_id]) {
+                        const call = state.peer.call(d.peer_id, state.localStream);
+                        handleStream(call);
+                   }
                 }
+            }
+            
+            if(d.type === "vc_signal_group" && d.vc_type === "leave") { 
+                removeVCUser(d.peer_id);
             }
         }
 
@@ -751,13 +745,14 @@ html_content = """
         }
 
         function addVCUser(id, name, pfp, isMe=false) {
-            if(state.vcUsers[id]) return;
+            if(document.getElementById(`vc-u-${id}`)) return;
             const grid = document.getElementById('vc-users-grid');
             const div = document.createElement('div');
             div.className = 'vc-user';
             div.id = `vc-u-${id}`;
+            const pfpUrl = pfp || `https://api.dicebear.com/7.x/identicon/svg?seed=${id}`;
             div.innerHTML = `
-                <img src="${pfp}" class="vc-avatar" id="avatar-${id}">
+                <img src="${pfpUrl}" class="vc-avatar" id="avatar-${id}">
                 <span class="vc-name">${name}${isMe ? ' (You)' : ''}</span>
             `;
             grid.appendChild(div);
@@ -768,8 +763,10 @@ html_content = """
             const u = document.getElementById(`vc-u-${id}`);
             if(u) u.remove();
             delete state.vcUsers[id];
+            if(state.vcCalls[id]) delete state.vcCalls[id];
         }
 
+        // --- VISUAL ANIMATION ---
         function setupAudioVisualizer(stream, id) {
             try {
                 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -781,10 +778,9 @@ html_content = """
                 const bufferLength = analyser.frequencyBinCount;
                 const dataArray = new Uint8Array(bufferLength);
                 
-                const avatar = document.getElementById(`avatar-${id}`);
-                
                 function animate() {
-                    if(!state.inVC || !document.getElementById(`avatar-${id}`)) return;
+                    const avatar = document.getElementById(`avatar-${id}`);
+                    if(!state.inVC || !avatar) return;
                     requestAnimationFrame(animate);
                     analyser.getByteFrequencyData(dataArray);
                     
@@ -794,9 +790,8 @@ html_content = """
                     
                     if(avg > 10) { 
                         const scale = 1 + (avg / 200);
-                        const glow = `0 0 0 ${avg/10}px var(--primary)`;
                         avatar.style.transform = `scale(${scale})`;
-                        avatar.style.boxShadow = glow;
+                        avatar.style.boxShadow = `0 0 0 ${avg/10}px var(--primary)`;
                         avatar.style.borderColor = 'var(--accent)';
                     } else {
                         avatar.style.transform = 'scale(1)';
@@ -808,6 +803,7 @@ html_content = """
             } catch(e) { console.log("Audio Viz Error", e); }
         }
 
+        // --- SCREEN SHARE ---
         async function toggleScreenShare() {
             if(!state.inVC) return alert("Join Voice first!");
             const btn = document.getElementById('btn-share');
@@ -817,7 +813,8 @@ html_content = """
                 btn.classList.remove('active');
                 const audioTrack = state.localStream.getAudioTracks()[0];
                 for (let peerId in state.vcCalls) {
-                    const sender = state.vcCalls[peerId].peerConnection.getSenders().find(s => s.track.kind === 'video' || s.track.kind === 'audio');
+                    const senders = state.vcCalls[peerId].peerConnection.getSenders();
+                    const sender = senders.find(s => s.track && (s.track.kind === 'video' || s.track.kind === 'audio'));
                     if(sender) sender.replaceTrack(audioTrack);
                 }
                 return;
@@ -826,16 +823,16 @@ html_content = """
             try {
                 const screenStream = await navigator.mediaDevices.getDisplayMedia({video: true, audio: true});
                 const screenTrack = screenStream.getVideoTracks()[0];
-                
                 state.isSharing = true;
                 btn.classList.add('active');
+                
                 screenTrack.onended = () => { if(state.isSharing) toggleScreenShare(); };
 
                 for (let peerId in state.vcCalls) {
-                    const sender = state.vcCalls[peerId].peerConnection.getSenders().find(s => s.track.kind === 'audio'); 
+                    const senders = state.vcCalls[peerId].peerConnection.getSenders();
+                    const sender = senders.find(s => s.track && s.track.kind === 'audio'); 
                     if(sender) sender.replaceTrack(screenTrack);
                 }
-                
             } catch(e) { console.error(e); state.isSharing = false; }
         }
 
@@ -857,3 +854,4 @@ html_content = """
     </script>
 </body>
 </html>
+"""
