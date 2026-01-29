@@ -12,7 +12,7 @@ from redis import asyncio as aioredis
 from botocore.config import Config
 
 # ==========================================
-# KUSTIFY HYPER-X | V10.0 (EVOLUTION)
+# KUSTIFY HYPER-X | V10.0 (STABLE)
 # ==========================================
 
 app = FastAPI(title="Kustify Hyper-X", version="10.0")
@@ -36,7 +36,7 @@ s3_client = boto3.client(
 )
 
 GLOBAL_CHANNEL = "kustify:global:v10"
-GROUPS_KEY = "kustify:groups:v10" # Hash: name -> json_meta
+GROUPS_KEY = "kustify:groups:v10" 
 HISTORY_KEY = "kustify:history:v10:"
 USERNAMES_KEY = "kustify:usernames:v10"
 
@@ -61,8 +61,11 @@ class ConnectionManager:
         await self.broadcast_presence(group_id)
 
     def disconnect(self, websocket: WebSocket, group_id: str, user_id: str):
-        if group_id in self.active_connections and websocket in self.active_connections[group_id]:
-            self.active_connections[group_id].remove(websocket)
+        if group_id in self.active_connections:
+            for conn in self.active_connections[group_id]:
+                if conn.client == websocket.client:
+                    self.active_connections[group_id].remove(conn)
+                    break
         self.global_lookup.pop(user_id, None)
         self.user_meta.pop(user_id, None)
 
@@ -97,6 +100,11 @@ async def redis_listener():
 
 @app.on_event("startup")
 async def startup():
+    # FIX: Check if key exists and is NOT a Hash (to avoid WRONGTYPE error)
+    key_type = await redis.type(GROUPS_KEY)
+    if key_type != "hash" and key_type != "none":
+        await redis.delete(GROUPS_KEY)
+    
     if not await redis.hexists(GROUPS_KEY, "Lobby"):
         await redis.hset(GROUPS_KEY, "Lobby", json.dumps({"private": False}))
     asyncio.create_task(redis_listener())
@@ -109,6 +117,7 @@ async def get_groups():
 @app.post("/api/groups")
 async def create_group(group: GroupCreate):
     name = re.sub(r'[^a-zA-Z0-9]', '', group.name)
+    if not name: return JSONResponse(status_code=400, content={"error": "Invalid name"})
     meta = {"private": group.is_private, "password": group.password}
     await redis.hset(GROUPS_KEY, name, json.dumps(meta))
     return {"status": "success", "name": name}
@@ -116,7 +125,7 @@ async def create_group(group: GroupCreate):
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
     ext = file.filename.split('.')[-1]
-    file_key = f"kustify_v10/{int(time.time())}.{ext}"
+    file_key = f"kustify_v10/{int(time.time())}_{os.urandom(2).hex()}.{ext}"
     s3_client.upload_fileobj(file.file, AWS_CONFIG["bucket"], file_key, ExtraArgs={'ContentType': file.content_type})
     url = s3_client.generate_presigned_url('get_object', Params={'Bucket': AWS_CONFIG["bucket"], 'Key': file_key}, ExpiresIn=604800)
     return {"url": url}
@@ -124,26 +133,27 @@ async def upload_file(file: UploadFile = File(...)):
 @app.websocket("/ws/{group_id}/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
     await websocket.accept()
-    init = await websocket.receive_json()
-    user_info = {"id": user_id, "name": init.get("name", "Anon"), "pfp": init.get("pfp", "")}
-    await manager.connect(websocket, group_id, user_info)
-    
     try:
+        init = await websocket.receive_json()
+        user_info = {"id": user_id, "name": init.get("name", "Anon"), "pfp": init.get("pfp", "")}
+        await manager.connect(websocket, group_id, user_info)
+        
         while True:
             data = await websocket.receive_json()
             data["user_id"] = user_id
             data["group_id"] = group_id
             data["timestamp"] = time.time()
             
-            if data["type"] == "edit":
-                # Handle message editing logic
+            if data.get("type") == "edit":
                 await redis.publish(GLOBAL_CHANNEL, json.dumps(data))
             else:
                 await redis.publish(GLOBAL_CHANNEL, json.dumps(data))
-                if data["type"] == "message":
+                if data.get("type") == "message":
                     await redis.rpush(f"{HISTORY_KEY}{group_id}", json.dumps(data))
     except WebSocketDisconnect:
         manager.disconnect(websocket, group_id, user_id)
+    except Exception:
+        pass
 
 # ==========================================
 # FRONTEND (WEB3 TELEGRAM STYLE)
@@ -151,73 +161,104 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
 
 html_content = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>KUSTIFY HYPER-X V10</title>
     <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.0.2/marked.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
     <style>
-        :root { --p: #7000ff; --s: #00f3ff; --bg: #0a0a0c; --glass: rgba(255,255,255,0.03); }
-        body { background: var(--bg); color: #fff; font-family: 'Inter', sans-serif; margin: 0; display: flex; height: 100vh; overflow: hidden; }
+        :root { --p: #7000ff; --s: #00f3ff; --bg: #050507; --panel: #111114; --glass: rgba(255,255,255,0.03); }
+        * { box-sizing: border-box; }
+        body { background: var(--bg); color: #fff; font-family: 'Outfit', sans-serif; margin: 0; display: flex; height: 100vh; overflow: hidden; }
         
-        #sidebar { width: 320px; border-right: 1px solid rgba(255,255,255,0.1); background: rgba(10,10,12,0.6); backdrop-filter: blur(20px); z-index: 10; }
-        #main { flex: 1; display: flex; flex-direction: column; position: relative; }
+        #sidebar { width: 320px; border-right: 1px solid rgba(255,255,255,0.08); background: var(--panel); z-index: 10; display: flex; flex-direction: column; }
+        #main { flex: 1; display: flex; flex-direction: column; position: relative; background: radial-gradient(circle at top right, #101018, #050507); }
         
-        /* Message Styling */
-        .msg { padding: 8px 15px; max-width: 70%; border-radius: 18px; margin-bottom: 4px; position: relative; }
-        .msg.me { align-self: flex-end; background: var(--p); border-bottom-right-radius: 4px; }
-        .msg.other { align-self: flex-start; background: var(--glass); border-bottom-left-radius: 4px; border: 1px solid rgba(255,255,255,0.05); }
-        .edit-btn { font-size: 10px; cursor: pointer; opacity: 0.5; margin-left: 8px; }
-        
-        /* Preview Overlay */
-        #preview-box { position: absolute; bottom: 80px; left: 20px; display: none; background: #111; padding: 10px; border-radius: 12px; border: 1px solid var(--s); }
-        #preview-img { max-height: 150px; border-radius: 8px; }
+        .nav-item { padding: 12px 20px; margin: 4px 10px; border-radius: 12px; cursor: pointer; transition: 0.2s; color: #888; display: flex; justify-content: space-between; align-items: center; }
+        .nav-item:hover { background: var(--glass); color: #fff; }
+        .nav-item.active { background: rgba(112, 0, 255, 0.1); color: var(--s); border: 1px solid rgba(0, 243, 255, 0.2); }
 
-        /* VC UI */
-        #vc-overlay { position: fixed; top: 20px; right: 20px; width: 240px; background: rgba(0,0,0,0.8); border-radius: 16px; padding: 15px; display: none; border: 1px solid var(--p); box-shadow: 0 0 20px rgba(112,0,255,0.3); }
-        video { width: 100%; border-radius: 8px; background: #000; margin-top: 10px; }
+        #feed { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 8px; }
+        .msg { padding: 12px 16px; max-width: 75%; border-radius: 18px; position: relative; font-size: 0.95rem; line-height: 1.4; }
+        .msg.me { align-self: flex-end; background: var(--p); border-bottom-right-radius: 4px; box-shadow: 0 4px 15px rgba(112,0,255,0.2); }
+        .msg.other { align-self: flex-start; background: #1c1c21; border-bottom-left-radius: 4px; }
+        .msg .meta { font-size: 0.7rem; opacity: 0.5; margin-top: 4px; display: flex; justify-content: flex-end; gap: 5px; }
+        
+        #preview-box { position: absolute; bottom: 90px; left: 20px; display: none; background: #16161a; padding: 12px; border-radius: 16px; border: 1px solid var(--s); z-index: 100; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        #preview-img { max-height: 200px; border-radius: 10px; display: block; }
+
+        #vc-overlay { position: fixed; top: 20px; right: 20px; width: 280px; background: rgba(15,15,20,0.95); backdrop-filter: blur(10px); border-radius: 20px; padding: 20px; display: none; border: 1px solid var(--p); z-index: 1000; }
+        video { width: 100%; border-radius: 12px; background: #000; margin-top: 10px; border: 1px solid #333; }
+        .btn { background: var(--glass); border: 1px solid rgba(255,255,255,0.1); color: #fff; padding: 8px 16px; border-radius: 10px; cursor: pointer; font-family: inherit; font-size: 0.85rem; }
+        .btn-p { background: var(--p); border: none; }
+        
+        .input-area { padding: 20px; background: rgba(10,10,12,0.9); border-top: 1px solid rgba(255,255,255,0.05); display: flex; gap: 12px; align-items: center; }
+        #msg-in { flex: 1; background: #1c1c21; border: 1px solid transparent; padding: 14px 20px; border-radius: 30px; color: #fff; outline: none; transition: 0.2s; }
+        #msg-in:focus { border-color: var(--p); background: #222228; }
     </style>
 </head>
 <body>
     <div id="sidebar">
-        <div style="padding: 25px; border-bottom: 1px solid rgba(255,255,255,0.05)">
-            <h2 style="color: var(--s); letter-spacing: -1px;">KUSTIFY <span style="font-weight: 300; opacity: 0.5;">X10</span></h2>
-            <button onclick="showCreateGroup()" style="width:100%; padding:10px; background:var(--glass); border:1px solid rgba(255,255,255,0.1); color:#fff; border-radius:8px; cursor:pointer;">+ New Channel</button>
+        <div style="padding: 30px 20px;">
+            <h2 style="color: var(--s); margin: 0; font-weight: 600; font-size: 1.4rem;">KUSTIFY <span style="font-weight: 300; opacity: 0.4;">V10</span></h2>
+            <p style="font-size: 0.7rem; color: #555; margin: 5px 0 20px;">HYPER-X INFRASTRUCTURE</p>
+            <button onclick="createGroupPrompt()" class="btn" style="width:100%; padding: 12px;">+ Create Channel</button>
         </div>
-        <div id="groups-list" style="padding: 10px;"></div>
+        <div id="groups-list" style="flex:1; overflow-y:auto;"></div>
     </div>
 
     <div id="main">
-        <div id="chat-header" style="padding: 15px 25px; display:flex; justify-content:space-between; align-items:center; background: rgba(255,255,255,0.02);">
-            <div id="active-group-name"># Lobby</div>
+        <div style="padding: 15px 25px; display:flex; justify-content:space-between; align-items:center; border-bottom: 1px solid rgba(255,255,255,0.05); backdrop-filter: blur(10px);">
+            <div id="active-group-name" style="font-weight: 600; font-size: 1.1rem;"># Lobby</div>
             <div style="display:flex; gap:10px;">
                 <button onclick="startCall(false)" class="btn">🎤 Voice</button>
                 <button onclick="startCall(true)" class="btn">🖥️ Share</button>
             </div>
         </div>
 
-        <div id="feed" style="flex:1; overflow-y:auto; padding: 25px; display:flex; flex-direction:column;"></div>
+        <div id="feed"></div>
 
         <div id="preview-box">
             <img id="preview-img">
-            <button onclick="cancelUpload()" style="display:block; width:100%; color:#ff4444; background:none; border:none; margin-top:5px;">Cancel</button>
+            <div style="display:flex; justify-content:space-between; margin-top:10px;">
+                <span style="font-size:0.7rem; color:var(--s)">PREVIEW_MODE</span>
+                <button onclick="cancelUpload()" style="background:none; border:none; color:#ff4444; cursor:pointer; font-size:0.75rem;">REMOVE</button>
+            </div>
         </div>
 
-        <div style="padding: 20px; display:flex; gap:12px; background: rgba(10,10,12,0.8);">
+        <div class="input-area">
             <input type="file" id="file-in" hidden onchange="showPreview(event)">
-            <button onclick="document.getElementById('file-in').click()" style="background:none; border:none; font-size:20px; cursor:pointer;">📎</button>
-            <input type="text" id="msg-in" placeholder="Message..." style="flex:1; background:var(--glass); border:1px solid rgba(255,255,255,0.1); padding:12px 20px; border-radius:25px; color:#fff;">
-            <button onclick="sendMsg()" style="background:var(--p); border:none; width:45px; height:45px; border-radius:50%; color:white; cursor:pointer;">➤</button>
+            <button onclick="document.getElementById('file-in').click()" style="background:none; border:none; font-size:1.4rem; cursor:pointer; opacity:0.6;">📎</button>
+            <input type="text" id="msg-in" placeholder="Write a message..." autocomplete="off">
+            <button onclick="sendMsg()" class="btn btn-p" style="width:48px; height:48px; border-radius:50%; font-size:1.2rem;">➤</button>
         </div>
     </div>
 
     <div id="vc-overlay">
-        <div style="font-size:12px; color:var(--s); margin-bottom:10px;">INFRA_LINK: ACTIVE</div>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:0.7rem; color:var(--s); font-weight:600;">STREAM_ACTIVE</span>
+            <div id="vc-timer" style="font-size:0.7rem; opacity:0.5;">00:00</div>
+        </div>
         <div id="remote-streams"></div>
         <video id="local-video" autoplay muted playsinline></video>
-        <button onclick="endCall()" style="width:100%; margin-top:10px; background:#ff4444; border:none; padding:8px; border-radius:8px; color:#fff;">Disconnect</button>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-top:15px;">
+            <button onclick="toggleMute()" class="btn" id="mute-btn">Mute</button>
+            <button onclick="endCall()" class="btn" style="background:#ff4444; border:none;">Leave</button>
+        </div>
     </div>
 
     <script>
+        const state = {
+            user: localStorage.getItem("kv9_user") || "Anon",
+            uid: "u_" + Math.random().toString(36).substr(2, 9),
+            pfp: "https://ui-avatars.com/api/?background=7000ff&color=fff&name=K",
+            group: "Lobby",
+            ws: null
+        };
+
         let currentFile = null;
         let editingId = null;
         let peer = null;
@@ -227,22 +268,76 @@ html_content = """
             const file = e.target.files[0];
             if (!file) return;
             currentFile = file;
-            const url = URL.createObjectURL(file);
-            document.getElementById('preview-img').src = url;
+            document.getElementById('preview-img').src = URL.createObjectURL(file);
             document.getElementById('preview-box').style.display = 'block';
         }
 
-        async function sendMsg() {
-            const text = document.getElementById('msg-in').value;
-            const payload = { type: "message", text: text };
+        function cancelUpload() {
+            currentFile = null;
+            document.getElementById('preview-box').style.display = 'none';
+            document.getElementById('file-in').value = '';
+        }
 
-            if (editingId) {
+        async function createGroupPrompt() {
+            const name = prompt("Channel Name:");
+            if(!name) return;
+            const isPrivate = confirm("Make Private?");
+            await fetch('/api/groups', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ name, is_private: isPrivate })
+            });
+            loadGroups();
+        }
+
+        async function loadGroups() {
+            const res = await fetch('/api/groups').then(r=>r.json());
+            const list = document.getElementById('groups-list');
+            list.innerHTML = '';
+            Object.keys(res.groups).forEach(name => {
+                const g = res.groups[name];
+                const div = document.createElement('div');
+                div.className = `nav-item ${state.group === name ? 'active' : ''}`;
+                div.innerHTML = `<span># ${name}</span> ${g.private ? '🔒' : ''}`;
+                div.onclick = () => switchGroup(name);
+                list.appendChild(div);
+            });
+        }
+
+        function switchGroup(name) {
+            state.group = name;
+            document.getElementById('active-group-name').innerText = `# ${name}`;
+            document.getElementById('feed').innerHTML = '';
+            initWS();
+            loadGroups();
+        }
+
+        function initWS() {
+            if(state.ws) state.ws.close();
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            state.ws = new WebSocket(`${proto}://${location.host}/ws/${state.group}/${state.uid}`);
+            state.ws.onopen = () => state.ws.send(JSON.stringify({name: state.user, pfp: state.pfp}));
+            state.ws.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                if(data.type === "message") renderMsg(data);
+                if(data.type === "edit") updateMsg(data);
+            };
+        }
+
+        async function sendMsg() {
+            const input = document.getElementById('msg-in');
+            const text = input.value.trim();
+            if(!text && !currentFile) return;
+
+            const payload = { type: "message", text: text, id: `m_${Date.now()}` };
+            
+            if(editingId) {
                 payload.type = "edit";
                 payload.id = editingId;
                 editingId = null;
             }
 
-            if (currentFile) {
+            if(currentFile) {
                 const fd = new FormData(); fd.append('file', currentFile);
                 const res = await fetch('/api/upload', {method:'POST', body:fd}).then(r=>r.json());
                 payload.image_url = res.url;
@@ -250,52 +345,68 @@ html_content = """
             }
 
             state.ws.send(JSON.stringify(payload));
-            document.getElementById('msg-in').value = '';
+            input.value = '';
         }
 
-        async function startCall(withScreen) {
+        function renderMsg(d) {
+            const feed = document.getElementById('feed');
+            const isMe = d.user_id === state.uid;
+            const div = document.createElement('div');
+            div.id = d.id;
+            div.className = `msg ${isMe ? 'me' : 'other'}`;
+            div.innerHTML = `
+                <div class="text">${marked.parse(d.text || '')}</div>
+                ${d.image_url ? `<img src="${d.image_url}" style="max-width:100%; border-radius:8px; margin-top:8px;">` : ''}
+                <div class="meta">${new Date(d.timestamp*1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})} ${isMe ? '✓' : ''}</div>
+            `;
+            feed.appendChild(div);
+            feed.scrollTop = feed.scrollHeight;
+        }
+
+        function updateMsg(d) {
+            const el = document.getElementById(d.id);
+            if(el) {
+                el.querySelector('.text').innerHTML = marked.parse(d.text) + ' <small style="opacity:0.5">(edited)</small>';
+            }
+        }
+
+        async function startCall(screen) {
             document.getElementById('vc-overlay').style.display = 'block';
-            localStream = withScreen ? 
+            localStream = screen ? 
                 await navigator.mediaDevices.getDisplayMedia({video: true, audio: true}) :
                 await navigator.mediaDevices.getUserMedia({audio: true, video: false});
             
-            if(withScreen) document.getElementById('local-video').srcObject = localStream;
+            if(screen) document.getElementById('local-video').srcObject = localStream;
             
             peer = new Peer(state.uid);
             peer.on('call', call => {
                 call.answer(localStream);
-                call.on('stream', stream => renderRemoteStream(stream, call.peer));
+                call.on('stream', s => renderRemote(s, call.peer));
             });
             state.ws.send(JSON.stringify({type: "vc_join"}));
         }
 
-        function renderRemoteStream(stream, id) {
-            if(document.getElementById(`v-${id}`)) return;
+        function renderRemote(s, id) {
+            if(document.getElementById('v-'+id)) return;
             const v = document.createElement('video');
-            v.id = `v-${id}`; v.srcObject = stream; v.autoplay = true;
+            v.id = 'v-'+id; v.srcObject = s; v.autoplay = true;
             document.getElementById('remote-streams').appendChild(v);
         }
 
-        function cancelUpload() {
-            currentFile = null;
-            document.getElementById('preview-box').style.display = 'none';
-        }
+        function endCall() { location.reload(); }
 
-        // Add context menu for editing
         window.addEventListener('contextmenu', e => {
-            const bubble = e.target.closest('.msg.me');
-            if(bubble) {
+            const m = e.target.closest('.msg.me');
+            if(m) {
                 e.preventDefault();
-                editingId = bubble.id;
-                document.getElementById('msg-in').value = bubble.querySelector('.text').innerText;
+                editingId = m.id;
+                document.getElementById('msg-in').value = m.querySelector('.text').innerText.replace('(edited)', '').trim();
                 document.getElementById('msg-in').focus();
             }
         });
+
+        window.onload = () => { loadGroups(); initWS(); };
     </script>
 </body>
 </html>
 """
-
-@app.get("/")
-async def get():
-    return HTMLResponse(html_content)
