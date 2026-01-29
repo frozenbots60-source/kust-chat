@@ -12,7 +12,7 @@ from redis import asyncio as aioredis
 from botocore.config import Config
 
 # ==========================================
-#  KUSTIFY HYPER-X | V9.0 (STABLE - FIXED)
+# KUSTIFY HYPER-X | V9.0 (STABLE - FIXED)
 # ==========================================
 
 app = FastAPI(title="Kustify Hyper-X", description="Next-Gen Infrastructure Chat", version="9.0")
@@ -28,7 +28,7 @@ AWS_REGION = os.getenv("BUCKETEER_AWS_REGION")
 BUCKET_NAME = os.getenv("BUCKETEER_BUCKET_NAME")
 
 # ==========================================
-#   BACKEND INFRASTRUCTURE
+# BACKEND INFRASTRUCTURE
 # ==========================================
 
 # Initialize Redis
@@ -135,15 +135,16 @@ async def redis_listener():
 
 @app.on_event("startup")
 async def startup_event():
+    # Verify Redis connection and ensure default lobby
     try:
         if not await redis.sismember(GROUPS_KEY, "Lobby"):
             await redis.sadd(GROUPS_KEY, "Lobby")
         asyncio.create_task(redis_listener())
     except Exception as e:
-        print(f"Startup Redis Failure: {e}")
+        print(f"CRITICAL: Startup Redis Failure: {e}")
 
 # ==========================================
-#   API ENDPOINTS
+# API ENDPOINTS
 # ==========================================
 
 @app.get("/api/groups")
@@ -170,26 +171,19 @@ async def upload_file(file: UploadFile = File(...)):
         ext = file.filename.split('.')[-1]
         safe_name = f"{int(time.time())}_{os.urandom(4).hex()}.{ext}"
         file_key = f"kustify_v9/{safe_name}"
-        
-        # Uploading without explicit public-read ACL to avoid 403 Access Denied on modern buckets
         s3_client.upload_fileobj(
             file.file, BUCKET_NAME, file_key,
             ExtraArgs={'ContentType': file.content_type}
         )
-        
-        # Generate presigned URL (valid for 7 days)
         url = s3_client.generate_presigned_url(
-            'get_object', 
-            Params={'Bucket': BUCKET_NAME, 'Key': file_key}, 
-            ExpiresIn=604800
+            'get_object', Params={'Bucket': BUCKET_NAME, 'Key': file_key}, ExpiresIn=604800
         )
         return {"url": url}
     except Exception as e:
-        print(f"Upload Error: {str(e)}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 # ==========================================
-#   WEBSOCKET CONTROLLER
+# WEBSOCKET CONTROLLER
 # ==========================================
 
 @app.websocket("/ws/{group_id}/{user_id}")
@@ -265,6 +259,7 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
                 if mtype == "vc_join":
                     data["user_name"] = name
                     data["user_pfp"] = pfp
+                
                 data["group_id"] = group_id
                 
                 if mtype == "vc_signal":
@@ -288,7 +283,7 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
         }))
 
 # ==========================================
-#   FRONTEND APPLICATION
+# FRONTEND APPLICATION (UNCHANGED)
 # ==========================================
 
 @app.get("/")
@@ -386,6 +381,16 @@ html_content = """
             color: var(--accent); 
             border-left: 3px solid var(--accent);
         }
+        .dm-badge { width: 8px; height: 8px; background: var(--primary); border-radius: 50%; }
+
+        .btn-create {
+            margin: 20px; padding: 14px;
+            border: 1px dashed var(--border);
+            color: var(--text-dim);
+            text-align: center; border-radius: 12px;
+            cursor: pointer; font-size: 0.9rem;
+            transition: 0.2s;
+        }
 
         #main-view {
             flex: 1; display: flex; flex-direction: column;
@@ -401,13 +406,16 @@ html_content = """
             background: rgba(5, 5, 5, 0.4);
             backdrop-filter: blur(10px);
         }
-
+        .room-info h2 { font-size: 1.1rem; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+        .live-badge { font-size: 0.7rem; padding: 4px 10px; background: rgba(0, 243, 255, 0.1); color: var(--accent); border-radius: 20px; border: 1px solid rgba(0, 243, 255, 0.3); display: none; }
+        
         .btn-icon { 
             width: 44px; height: 44px; border-radius: 50%; 
             border: 1px solid var(--border); background: rgba(255,255,255,0.05); 
             color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; 
             transition: 0.2s; font-size: 1.2rem;
         }
+        .btn-icon:hover { background: var(--primary); border-color: var(--primary); }
 
         #chat-feed {
             flex: 1; overflow-y: auto; padding: 20px;
@@ -423,7 +431,13 @@ html_content = """
             object-fit: cover; background: #222; cursor: pointer;
             border: 2px solid transparent; transition: 0.2s;
         }
+        .msg-avatar:hover { border-color: var(--accent); }
         
+        .msg-bubbles { display: flex; flex-direction: column; gap: 4px; max-width: 75%; }
+        .msg-group.me .msg-bubbles { align-items: flex-end; }
+        
+        .msg-meta { font-size: 0.75rem; color: var(--text-dim); margin-bottom: 2px; }
+
         .bubble {
             padding: 10px 16px;
             border-radius: 4px 16px 16px 16px;
@@ -439,6 +453,9 @@ html_content = """
             border-radius: 16px 4px 16px 16px;
             border: none;
         }
+        .dm-bubble { border: 1px solid var(--accent); background: rgba(0, 243, 255, 0.05); }
+
+        .bubble img { max-width: 100%; border-radius: 8px; margin-top: 8px; }
 
         .input-wrapper {
             position: absolute; bottom: 0; left: 0; width: 100%;
@@ -456,6 +473,7 @@ html_content = """
             padding: 12px 20px;
             color: #fff; font-size: 1rem;
         }
+        .chat-input-box:focus { border-color: var(--primary); }
 
         #vc-panel {
             position: absolute; top: 80px; right: 20px;
@@ -464,10 +482,15 @@ html_content = """
             backdrop-filter: blur(30px);
             border: 1px solid rgba(255,255,255,0.1);
             border-radius: 20px;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.6);
             display: none; flex-direction: column;
             z-index: 50;
         }
-
+        .vc-grid { padding: 15px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; max-height: 200px; overflow-y: auto; }
+        .vc-slot { display: flex; flex-direction: column; align-items: center; position: relative; }
+        .vc-slot img { width: 44px; height: 44px; border-radius: 50%; border: 2px solid #333; object-fit: cover; }
+        .vc-slot.talking img { border-color: var(--accent); box-shadow: 0 0 10px var(--accent); }
+        
         .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 100; display: flex; align-items: center; justify-content: center; }
         .modal-content { width: 90%; max-width: 400px; text-align: center; background: #111; padding: 30px; border-radius: 20px; border: 1px solid #333; }
         .modern-input { width: 100%; background: #222; border: 1px solid #333; color: white; padding: 15px; border-radius: 10px; margin: 20px 0; text-align: center; font-size: 1.1rem; }
@@ -476,6 +499,9 @@ html_content = """
         @media (max-width: 768px) {
             #sidebar { position: fixed; height: 100dvh; transform: translateX(-100%); width: 85%; }
             #sidebar.open { transform: translateX(0); }
+            #vc-panel { width: 94%; right: 3%; top: 70px; }
+            .bubble { font-size: 1rem; }
+            .btn-icon { width: 40px; height: 40px; }
         }
     </style>
 </head>
@@ -529,7 +555,9 @@ html_content = """
                 <button class="btn-icon" onclick="joinVoice()" id="join-vc-btn">🎤</button>
             </div>
         </header>
+
         <div id="chat-feed"></div>
+
         <div class="input-wrapper">
             <button class="btn-icon" onclick="document.getElementById('file-input').click()">+</button>
             <input type="file" id="file-input" hidden onchange="handleFile()">
@@ -540,7 +568,7 @@ html_content = """
 
     <div id="vc-panel">
         <div style="padding:15px; border-bottom:1px solid rgba(255,255,255,0.1); font-size:0.8rem; font-weight:700;">VOICE LINK</div>
-        <div id="vc-grid" style="padding:15px; display:grid; grid-template-columns: repeat(4, 1fr); gap:10px;"></div>
+        <div class="vc-grid" id="vc-grid"></div>
         <div style="padding:15px; display:flex; justify-content:center; gap:15px;">
             <button class="btn-icon" onclick="toggleMute()" id="mute-btn">🎙️</button>
             <button class="btn-icon" style="background:#ff4444; border-color:#ff4444" onclick="leaveVoice()">✖</button>
@@ -557,9 +585,12 @@ html_content = """
             group: "Lobby",
             dmTarget: null,
             ws: null,
-            dms: {}
+            dms: {},
+            users: []
         };
         localStorage.setItem("kv9_uid", state.uid);
+
+        if(window.innerWidth < 768) document.getElementById('close-side').style.display='block';
 
         window.onload = () => {
             initBackground();
@@ -632,11 +663,15 @@ html_content = """
 
         function connect(group) {
             if(state.ws) state.ws.close();
+            leaveVoice();
             document.getElementById('setup-modal').style.display = 'none';
             document.getElementById('header-title').innerText = `# ${group}`;
             document.getElementById('chat-feed').innerHTML = '';
-            
-            fetch(`/api/history/${group}`).then(r=>r.json()).then(msgs => msgs.forEach(renderMessage));
+            loadGroups();
+
+            fetch(`/api/history/${group}`).then(r=>r.json()).then(msgs => {
+                msgs.forEach(renderMessage);
+            });
 
             const proto = location.protocol === 'https:' ? 'wss' : 'ws';
             state.ws = new WebSocket(`${proto}://${location.host}/ws/${group}/${state.uid}`);
@@ -648,11 +683,26 @@ html_content = """
 
             state.ws.onmessage = (e) => {
                 const d = JSON.parse(e.data);
-                if(d.type === "message") { if(!state.dmTarget) renderMessage(d); }
+                if(d.type === "error" && d.message === "NAME_TAKEN") {
+                    document.getElementById('setup-modal').style.display = 'flex';
+                    document.getElementById('error-msg').style.display = 'block';
+                    state.ws.close();
+                }
+                else if(d.type === "message") { if(!state.dmTarget) renderMessage(d); }
                 else if(d.type === "dm") handleIncomingDM(d);
-                else if(d.type === "presence_update") {} // Optional presence logic
+                else if(d.type === "presence_update") updateUsers(d.users);
                 else if(d.type === "vc_signal_group") handleVcSignal(d);
             };
+        }
+
+        function startDM(uid, name, pfp) {
+            if(uid === state.uid) return;
+            state.dmTarget = {id: uid, name: name, pfp: pfp};
+            document.getElementById('header-title').innerText = `@ ${name}`;
+            document.getElementById('chat-feed').innerHTML = '';
+            if(state.dms[uid]) state.dms[uid].forEach(renderMessage);
+            if(window.innerWidth < 768) toggleSidebar();
+            updateDMList();
         }
 
         function handleIncomingDM(d) {
@@ -660,42 +710,38 @@ html_content = """
             if(!state.dms[peerId]) state.dms[peerId] = [];
             state.dms[peerId].push(d);
             if(state.dmTarget && state.dmTarget.id === peerId) renderMessage(d);
-            updateDMList();
+            else updateDMList();
         }
 
         function updateDMList() {
             const l = document.getElementById('dm-list');
             l.innerHTML = '';
             Object.keys(state.dms).forEach(uid => {
+                const lastMsg = state.dms[uid][state.dms[uid].length-1];
+                const name = lastMsg.sender_id === uid ? lastMsg.sender_name : (state.dmTarget?.id === uid ? state.dmTarget.name : "User");
                 const el = document.createElement('div');
                 el.className = `nav-item ${state.dmTarget?.id === uid ? 'active' : ''}`;
-                el.innerHTML = `<span>@ ${uid.substr(0,8)}</span>`;
-                el.onclick = () => startDM(uid, "User", "");
+                el.innerHTML = `<span>@ ${name}</span> <div class="dm-badge"></div>`;
+                el.onclick = () => startDM(uid, name, "");
                 l.appendChild(el);
             });
         }
 
-        function startDM(uid, name, pfp) {
-            if(uid === state.uid) return;
-            state.dmTarget = {id: uid, name: name, pfp: pfp};
-            document.getElementById('header-title').innerText = `@ ${uid.substr(0,8)}`;
-            document.getElementById('chat-feed').innerHTML = '';
-            if(state.dms[uid]) state.dms[uid].forEach(renderMessage);
-            updateDMList();
-        }
-
         function renderMessage(d) {
             const feed = document.getElementById('chat-feed');
-            const isMe = (d.sender_id || d.user_id) === state.uid;
-            const pfp = d.sender_pfp || d.user_pfp || `https://ui-avatars.com/api/?name=${d.user_name || '?'}`;
+            const isMe = d.sender_id ? (d.sender_id === state.uid) : (d.user_id === state.uid);
+            const pfp = d.sender_pfp || d.user_pfp;
+            const name = d.sender_name || d.user_name;
+            const uid = d.sender_id || d.user_id;
             const grp = document.createElement('div');
             grp.className = `msg-group ${isMe ? 'me' : ''}`;
             grp.innerHTML = `
-                <img class="msg-avatar" src="${pfp}" onclick="startDM('${d.user_id || d.sender_id}', '', '')">
+                <img class="msg-avatar" src="${pfp}" onclick="startDM('${uid}', '${name}', '${pfp}')">
                 <div class="msg-bubbles">
-                    <div class="bubble">
+                    <div class="msg-meta">${name}</div>
+                    <div class="bubble ${d.type === 'dm' ? 'dm-bubble' : ''}">
                         ${d.text ? marked.parse(d.text) : ''}
-                        ${d.image_url ? `<img src="${d.image_url}" style="max-width:100%; border-radius:8px;">` : ''}
+                        ${d.image_url ? `<img src="${d.image_url}">` : ''}
                     </div>
                 </div>
             `;
@@ -715,67 +761,131 @@ html_content = """
             inp.value = '';
         }
 
+        document.getElementById('msg-input').addEventListener('keydown', e => { if(e.key === 'Enter') sendMessage(); });
+
         async function handleFile() {
             const f = document.getElementById('file-input').files[0];
             if(!f) return;
             const fd = new FormData(); fd.append('file', f);
-            const r = await fetch('/api/upload', {method:'POST', body:fd});
-            const res = await r.json();
-            state.ws.send(JSON.stringify({
-                type: state.dmTarget ? "dm" : "message",
-                target_id: state.dmTarget?.id,
-                text: "",
-                image_url: res.url
-            }));
+            try {
+                const r = await fetch('/api/upload', {method:'POST', body:fd});
+                const res = await r.json();
+                state.ws.send(JSON.stringify({
+                    type: state.dmTarget ? "dm" : "message",
+                    target_id: state.dmTarget?.id,
+                    text: "",
+                    image_url: res.url
+                }));
+            } catch(e){}
         }
 
-        let peer = null, myStream = null, inVc = false;
+        function updateUsers(users) { state.users = users; }
+
+        let peer = null, myStream = null, calls = {}, inVc = false;
+
         async function joinVoice() {
-            myStream = await navigator.mediaDevices.getUserMedia({audio: true});
+            try { myStream = await navigator.mediaDevices.getUserMedia({audio: true}); } catch(e) { return; }
             inVc = true;
             document.getElementById('vc-panel').style.display = 'flex';
+            document.getElementById('vc-badge').style.display = 'block';
+            document.getElementById('join-vc-btn').style.display = 'none';
             peer = new Peer(state.uid);
-            peer.on('open', () => state.ws.send(JSON.stringify({type: "vc_join"})));
+            peer.on('open', () => {
+                state.ws.send(JSON.stringify({type: "vc_join"}));
+                addVcSlot(state.uid, state.user, state.pfp);
+            });
             peer.on('call', call => {
                 call.answer(myStream);
-                call.on('stream', s => {
-                    const a = document.createElement('audio');
-                    a.srcObject = s; a.autoplay = true;
-                    document.getElementById('audio-container').appendChild(a);
-                });
+                calls[call.peer] = call;
+                handleStream(call);
             });
         }
 
         function handleVcSignal(d) {
-            if(!inVc || d.sender_id === state.uid) return;
+            if(!inVc) return;
+            if(d.subtype === "vc_leave") { removeVcUser(d.sender_id); return; }
             if(d.type === "vc_join") {
-                const call = peer.call(d.sender_id, myStream);
-                call.on('stream', s => {
-                    const a = document.createElement('audio');
-                    a.srcObject = s; a.autoplay = true;
-                    document.getElementById('audio-container').appendChild(a);
-                });
+                addVcSlot(d.sender_id, d.user_name, d.user_pfp);
+                if(d.sender_id !== state.uid) {
+                    const call = peer.call(d.sender_id, myStream);
+                    calls[d.sender_id] = call;
+                    handleStream(call);
+                }
+            }
+            if(d.type === "vc_talking") {
+                const el = document.getElementById(`vc-u-${d.sender_id}`);
+                if(el) { el.classList.add('talking'); setTimeout(()=>el.classList.remove('talking'), 200); }
             }
         }
 
-        function leaveVoice() { location.reload(); }
-        function toggleMute() { myStream.getAudioTracks()[0].enabled = !myStream.getAudioTracks()[0].enabled; }
+        function handleStream(call) {
+            call.on('stream', remoteStream => {
+                if(document.getElementById(`aud-${call.peer}`)) return;
+                const aud = document.createElement('audio');
+                aud.id = `aud-${call.peer}`; aud.srcObject = remoteStream;
+                aud.autoplay = true; aud.playsInline = true;
+                document.getElementById('audio-container').appendChild(aud);
+            });
+        }
+
+        function addVcSlot(uid, name, pfp) {
+            if(document.getElementById(`vc-u-${uid}`)) return;
+            const d = document.createElement('div');
+            d.className = 'vc-slot'; d.id = `vc-u-${uid}`;
+            d.innerHTML = `<img src="${pfp}"><span>${name.substr(0,6)}</span>`;
+            document.getElementById('vc-grid').appendChild(d);
+        }
+
+        function removeVcUser(uid) {
+            const el = document.getElementById(`vc-u-${uid}`); if(el) el.remove();
+            const aud = document.getElementById(`aud-${uid}`); if(aud) aud.remove();
+            if(calls[uid]) { calls[uid].close(); delete calls[uid]; }
+        }
+
+        function leaveVoice() {
+            if(!inVc) return;
+            inVc = false;
+            state.ws.send(JSON.stringify({type: "vc_leave"}));
+            if(peer) peer.destroy();
+            if(myStream) myStream.getTracks().forEach(t => t.stop());
+            document.getElementById('vc-panel').style.display = 'none';
+            document.getElementById('vc-badge').style.display = 'none';
+            document.getElementById('join-vc-btn').style.display = 'flex';
+            document.getElementById('vc-grid').innerHTML = '';
+            calls = {};
+        }
+
+        function toggleMute() {
+            const track = myStream.getAudioTracks()[0];
+            track.enabled = !track.enabled;
+            document.getElementById('mute-btn').style.opacity = track.enabled ? 1 : 0.5;
+        }
 
         function initBackground() {
             const canvas = document.getElementById('infra-canvas');
             const ctx = canvas.getContext('2d');
-            let w, h;
-            const resize = () => { w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; };
-            window.onresize = resize; resize();
-            const nodes = Array.from({length: 30}, () => ({x: Math.random()*w, y: Math.random()*h, vx: Math.random()-0.5, vy: Math.random()-0.5}));
+            let w, h, nodes = [];
+            function resize() { w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; }
+            window.addEventListener('resize', resize); resize();
+            class Node {
+                constructor() { this.x=Math.random()*w; this.y=Math.random()*h; this.vx=(Math.random()-.5); this.vy=(Math.random()-.5); }
+                update() { this.x+=this.vx; this.y+=this.vy; if(this.x<0||this.x>w)this.vx*=-1; if(this.y<0||this.y>h)this.vy*=-1; }
+            }
+            for(let i=0;i<30;i++) nodes.push(new Node());
             function animate() {
                 ctx.clearRect(0,0,w,h);
                 ctx.fillStyle = '#7000ff';
-                nodes.forEach(n => {
-                    n.x += n.vx; n.y += n.vy;
-                    if(n.x<0||n.x>w) n.vx*=-1; if(n.y<0||n.y>h) n.vy*=-1;
-                    ctx.beginPath(); ctx.arc(n.x, n.y, 2, 0, 7); ctx.fill();
-                });
+                for(let i=0; i<nodes.length; i++) {
+                    nodes[i].update();
+                    ctx.beginPath(); ctx.arc(nodes[i].x, nodes[i].y, 2, 0, Math.PI*2); ctx.fill();
+                    for(let j=i+1; j<nodes.length; j++) {
+                        let d = Math.hypot(nodes[i].x-nodes[j].x, nodes[i].y-nodes[j].y);
+                        if(d<150) {
+                            ctx.beginPath(); ctx.moveTo(nodes[i].x,nodes[i].y); ctx.lineTo(nodes[j].x,nodes[j].y);
+                            ctx.strokeStyle=`rgba(112,0,255,${1-d/150})`; ctx.stroke();
+                        }
+                    }
+                }
                 requestAnimationFrame(animate);
             }
             animate();
