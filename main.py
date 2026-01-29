@@ -34,7 +34,7 @@ BUCKET_NAME = os.getenv("BUCKETEER_BUCKET_NAME")
 # Initialize Redis
 redis = aioredis.from_url(REDIS_URL, decode_responses=True)
 
-# Initialize S3 with SigV4 support (Required for newer regions/Bucketeer)
+# Initialize S3 with SigV4 support
 s3_client = boto3.client(
     's3',
     aws_access_key_id=AWS_ACCESS_KEY,
@@ -135,7 +135,6 @@ async def redis_listener():
 
 @app.on_event("startup")
 async def startup_event():
-    # Verify Redis connection and ensure default lobby
     try:
         if not await redis.sismember(GROUPS_KEY, "Lobby"):
             await redis.sadd(GROUPS_KEY, "Lobby")
@@ -259,7 +258,6 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
                 if mtype == "vc_join":
                     data["user_name"] = name
                     data["user_pfp"] = pfp
-                
                 data["group_id"] = group_id
                 
                 if mtype == "vc_signal":
@@ -283,7 +281,7 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
         }))
 
 # ==========================================
-# FRONTEND APPLICATION (UNCHANGED)
+# FRONTEND APPLICATION
 # ==========================================
 
 @app.get("/")
@@ -312,208 +310,43 @@ html_content = """
             --glass: blur(20px) saturate(180%);
             --radius: 16px;
         }
-
-        * { margin: 0; padding: 0; box-sizing: border-box; outline: none; -webkit-tap-highlight-color: transparent; }
-        
-        body {
-            font-family: 'Outfit', sans-serif;
-            background: var(--bg-dark);
-            color: var(--text-main);
-            height: 100dvh; 
-            overflow: hidden;
-            display: flex;
-        }
-
-        #infra-canvas {
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            z-index: 0; opacity: 0.3; pointer-events: none;
-        }
-
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
-
-        #sidebar {
-            width: 280px;
-            background: rgba(10, 10, 12, 0.8);
-            backdrop-filter: var(--glass);
-            border-right: 1px solid var(--border);
-            z-index: 20;
-            display: flex; flex-direction: column;
-            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-        }
-
-        .brand-area {
-            padding: 24px;
-            font-family: 'JetBrains Mono', monospace;
-            font-weight: 800;
-            font-size: 1.2rem;
-            letter-spacing: -1px;
-            border-bottom: 1px solid var(--border);
-            display: flex; justify-content: space-between; align-items: center;
-        }
-
-        .user-card {
-            padding: 20px;
-            display: flex; align-items: center; gap: 12px;
-            border-bottom: 1px solid var(--border);
-            background: rgba(255,255,255,0.02);
-        }
-        .user-card img {
-            width: 42px; height: 42px; border-radius: 12px;
-            border: 2px solid var(--primary);
-        }
-
+        * { margin: 0; padding: 0; box-sizing: border-box; outline: none; }
+        body { font-family: 'Outfit', sans-serif; background: var(--bg-dark); color: var(--text-main); height: 100dvh; overflow: hidden; display: flex; }
+        #infra-canvas { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 0; opacity: 0.3; pointer-events: none; }
+        #sidebar { width: 280px; background: rgba(10, 10, 12, 0.8); backdrop-filter: var(--glass); border-right: 1px solid var(--border); z-index: 20; display: flex; flex-direction: column; transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+        .brand-area { padding: 24px; font-family: 'JetBrains Mono', monospace; font-weight: 800; font-size: 1.2rem; border-bottom: 1px solid var(--border); }
+        .user-card { padding: 20px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid var(--border); }
+        .user-card img { width: 42px; height: 42px; border-radius: 12px; border: 2px solid var(--primary); }
         .nav-list { flex: 1; padding: 15px; overflow-y: auto; }
-        .section-label { padding: 10px 5px; font-size: 0.7rem; color: #666; font-weight: 700; letter-spacing: 1px; margin-top: 10px; }
-        
-        .nav-item {
-            padding: 12px 14px; margin-bottom: 6px;
-            border-radius: 8px;
-            color: var(--text-dim);
-            font-size: 0.95rem;
-            cursor: pointer;
-            transition: 0.2s;
-            display: flex; justify-content: space-between; align-items: center;
-        }
-        .nav-item:hover { background: rgba(255,255,255,0.05); color: #fff; }
-        .nav-item.active { 
-            background: rgba(112, 0, 255, 0.15); 
-            color: var(--accent); 
-            border-left: 3px solid var(--accent);
-        }
-        .dm-badge { width: 8px; height: 8px; background: var(--primary); border-radius: 50%; }
-
-        .btn-create {
-            margin: 20px; padding: 14px;
-            border: 1px dashed var(--border);
-            color: var(--text-dim);
-            text-align: center; border-radius: 12px;
-            cursor: pointer; font-size: 0.9rem;
-            transition: 0.2s;
-        }
-
-        #main-view {
-            flex: 1; display: flex; flex-direction: column;
-            position: relative; z-index: 5;
-            background: radial-gradient(circle at top right, rgba(112,0,255,0.08), transparent 40%);
-        }
-
-        header {
-            height: 70px;
-            display: flex; justify-content: space-between; align-items: center;
-            padding: 0 20px;
-            border-bottom: 1px solid var(--border);
-            background: rgba(5, 5, 5, 0.4);
-            backdrop-filter: blur(10px);
-        }
-        .room-info h2 { font-size: 1.1rem; font-weight: 600; display: flex; align-items: center; gap: 10px; }
-        .live-badge { font-size: 0.7rem; padding: 4px 10px; background: rgba(0, 243, 255, 0.1); color: var(--accent); border-radius: 20px; border: 1px solid rgba(0, 243, 255, 0.3); display: none; }
-        
-        .btn-icon { 
-            width: 44px; height: 44px; border-radius: 50%; 
-            border: 1px solid var(--border); background: rgba(255,255,255,0.05); 
-            color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; 
-            transition: 0.2s; font-size: 1.2rem;
-        }
-        .btn-icon:hover { background: var(--primary); border-color: var(--primary); }
-
-        #chat-feed {
-            flex: 1; overflow-y: auto; padding: 20px;
-            display: flex; flex-direction: column; gap: 15px;
-            padding-bottom: 100px; 
-        }
-
-        .msg-group { display: flex; gap: 12px; animation: slideIn 0.2s ease-out; width: 100%; }
+        .nav-item { padding: 12px 14px; margin-bottom: 6px; border-radius: 8px; color: var(--text-dim); cursor: pointer; transition: 0.2s; display: flex; justify-content: space-between; }
+        .nav-item.active { background: rgba(112, 0, 255, 0.15); color: var(--accent); border-left: 3px solid var(--accent); }
+        #main-view { flex: 1; display: flex; flex-direction: column; position: relative; z-index: 5; }
+        header { height: 70px; display: flex; justify-content: space-between; align-items: center; padding: 0 20px; border-bottom: 1px solid var(--border); background: rgba(5, 5, 5, 0.4); backdrop-filter: blur(10px); }
+        #chat-feed { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 15px; padding-bottom: 100px; }
+        .msg-group { display: flex; gap: 12px; width: 100%; }
         .msg-group.me { flex-direction: row-reverse; }
-        
-        .msg-avatar { 
-            width: 38px; height: 38px; border-radius: 10px; 
-            object-fit: cover; background: #222; cursor: pointer;
-            border: 2px solid transparent; transition: 0.2s;
-        }
-        .msg-avatar:hover { border-color: var(--accent); }
-        
-        .msg-bubbles { display: flex; flex-direction: column; gap: 4px; max-width: 75%; }
-        .msg-group.me .msg-bubbles { align-items: flex-end; }
-        
-        .msg-meta { font-size: 0.75rem; color: var(--text-dim); margin-bottom: 2px; }
-
-        .bubble {
-            padding: 10px 16px;
-            border-radius: 4px 16px 16px 16px;
-            background: #1e1e22;
-            font-size: 0.95rem;
-            line-height: 1.5;
-            color: #e4e4e7;
-            border: 1px solid rgba(255,255,255,0.05);
-            word-wrap: break-word;
-        }
-        .msg-group.me .bubble {
-            background: linear-gradient(135deg, #6002ee, #9c27b0);
-            border-radius: 16px 4px 16px 16px;
-            border: none;
-        }
-        .dm-bubble { border: 1px solid var(--accent); background: rgba(0, 243, 255, 0.05); }
-
-        .bubble img { max-width: 100%; border-radius: 8px; margin-top: 8px; }
-
-        .input-wrapper {
-            position: absolute; bottom: 0; left: 0; width: 100%;
-            padding: 15px;
-            background: rgba(5,5,5,0.9);
-            backdrop-filter: blur(20px);
-            border-top: 1px solid var(--border);
-            display: flex; gap: 10px; align-items: center;
-        }
-        
-        .chat-input-box {
-            flex: 1; background: #121214;
-            border: 1px solid var(--border);
-            border-radius: 25px;
-            padding: 12px 20px;
-            color: #fff; font-size: 1rem;
-        }
-        .chat-input-box:focus { border-color: var(--primary); }
-
-        #vc-panel {
-            position: absolute; top: 80px; right: 20px;
-            width: 300px;
-            background: rgba(15, 15, 20, 0.95);
-            backdrop-filter: blur(30px);
-            border: 1px solid rgba(255,255,255,0.1);
-            border-radius: 20px;
-            box-shadow: 0 20px 50px rgba(0,0,0,0.6);
-            display: none; flex-direction: column;
-            z-index: 50;
-        }
-        .vc-grid { padding: 15px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; max-height: 200px; overflow-y: auto; }
-        .vc-slot { display: flex; flex-direction: column; align-items: center; position: relative; }
-        .vc-slot img { width: 44px; height: 44px; border-radius: 50%; border: 2px solid #333; object-fit: cover; }
-        .vc-slot.talking img { border-color: var(--accent); box-shadow: 0 0 10px var(--accent); }
-        
+        .msg-avatar { width: 38px; height: 38px; border-radius: 10px; object-fit: cover; }
+        .bubble { padding: 10px 16px; border-radius: 4px 16px 16px 16px; background: #1e1e22; max-width: 75%; }
+        .msg-group.me .bubble { background: linear-gradient(135deg, #6002ee, #9c27b0); border-radius: 16px 4px 16px 16px; }
+        .input-wrapper { position: absolute; bottom: 0; left: 0; width: 100%; padding: 15px; background: rgba(5,5,5,0.9); border-top: 1px solid var(--border); display: flex; gap: 10px; }
+        .chat-input-box { flex: 1; background: #121214; border: 1px solid var(--border); border-radius: 25px; padding: 12px 20px; color: #fff; }
+        .btn-icon { width: 44px; height: 44px; border-radius: 50%; border: 1px solid var(--border); background: rgba(255,255,255,0.05); color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+        #vc-panel { position: absolute; top: 80px; right: 20px; width: 300px; background: rgba(15, 15, 20, 0.95); border-radius: 20px; display: none; z-index: 50; }
         .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 100; display: flex; align-items: center; justify-content: center; }
         .modal-content { width: 90%; max-width: 400px; text-align: center; background: #111; padding: 30px; border-radius: 20px; border: 1px solid #333; }
-        .modern-input { width: 100%; background: #222; border: 1px solid #333; color: white; padding: 15px; border-radius: 10px; margin: 20px 0; text-align: center; font-size: 1.1rem; }
-        .btn-start { background: var(--primary); color: white; border: none; padding: 15px; width: 100%; border-radius: 10px; font-weight: 700; cursor: pointer; font-size: 1rem; }
-
-        @media (max-width: 768px) {
-            #sidebar { position: fixed; height: 100dvh; transform: translateX(-100%); width: 85%; }
-            #sidebar.open { transform: translateX(0); }
-            #vc-panel { width: 94%; right: 3%; top: 70px; }
-            .bubble { font-size: 1rem; }
-            .btn-icon { width: 40px; height: 40px; }
-        }
+        .modern-input { width: 100%; background: #222; border: 1px solid #333; color: white; padding: 15px; border-radius: 10px; margin: 20px 0; text-align: center; }
+        .btn-start { background: var(--primary); color: white; border: none; padding: 15px; width: 100%; border-radius: 10px; font-weight: 700; cursor: pointer; }
+        @media (max-width: 768px) { #sidebar { position: fixed; height: 100dvh; transform: translateX(-100%); width: 85%; } #sidebar.open { transform: translateX(0); } }
     </style>
 </head>
 <body>
     <canvas id="infra-canvas"></canvas>
-
     <div id="setup-modal" class="modal">
         <div class="modal-content">
             <h2 style="font-family:'JetBrains Mono'; color:var(--accent)">IDENTITY_INIT</h2>
             <div style="margin: 20px auto; width: 100px; height: 100px; position: relative;">
-                <img id="preview-pfp" src="https://ui-avatars.com/api/?background=random&name=?" style="width:100%; height:100%; border-radius:50%; object-fit:cover; border:2px solid #333;">
-                <label for="pfp-upload" style="position:absolute; bottom:0; right:0; background:var(--primary); width:32px; height:32px; border-radius:50%; display:flex; align-items:center; justify-content:center;">📷</label>
+                <img id="preview-pfp" src="https://ui-avatars.com/api/?background=random&name=?" style="width:100%; height:100%; border-radius:50%; object-fit:cover;">
+                <label for="pfp-upload" style="position:absolute; bottom:0; right:0; background:var(--primary); width:32px; height:32px; border-radius:50%; display:flex; align-items:center; justify-content:center; cursor:pointer;">📷</label>
             </div>
             <input type="file" id="pfp-upload" hidden onchange="uploadPfp()">
             <input type="text" id="username-input" class="modern-input" placeholder="Unique Alias" maxlength="12">
@@ -521,43 +354,28 @@ html_content = """
             <p id="error-msg" style="color:#ff4444; font-size:0.8rem; margin-top:10px; display:none;">Alias Taken</p>
         </div>
     </div>
-
     <div id="sidebar">
-        <div class="brand-area">
-            KUSTIFY V9
-            <span onclick="toggleSidebar()" style="cursor:pointer; font-size:1.5rem; display:none;" id="close-side">×</span>
-        </div>
-        <div class="user-card">
-            <img id="side-pfp">
-            <div>
-                <div id="side-name" style="font-weight:700"></div>
-                <div style="font-size:0.75rem; color:var(--accent)">● SECURE</div>
-            </div>
-        </div>
-        
+        <div class="brand-area">KUSTIFY V9</div>
+        <div class="user-card"><img id="side-pfp"><div><div id="side-name" style="font-weight:700"></div><div style="font-size:0.75rem; color:var(--accent)">● SECURE</div></div></div>
         <div class="nav-list" id="nav-list">
-            <div class="section-label">CHANNELS</div>
+            <div style="font-size: 0.7rem; color: #666; margin-bottom: 10px;">CHANNELS</div>
             <div id="group-list"></div>
-            <div class="section-label">DIRECT MESSAGES</div>
+            <div style="font-size: 0.7rem; color: #666; margin: 20px 0 10px;">DIRECT MESSAGES</div>
             <div id="dm-list"></div>
         </div>
-        <div class="btn-create" onclick="createGroup()">+ New Node</div>
     </div>
-
     <div id="main-view">
         <header>
-            <div class="room-info">
-                <button onclick="toggleSidebar()" class="btn-icon" style="margin-right:10px; border:none; background:transparent;">☰</button> 
+            <div style="display:flex; align-items:center;">
+                <button onclick="toggleSidebar()" class="btn-icon" style="margin-right:10px; border:none; background:transparent;">☰</button>
                 <span id="header-title"># Lobby</span>
             </div>
             <div style="display:flex; gap:10px; align-items:center;">
-                <span class="live-badge" id="vc-badge">VOICE</span>
+                <span id="vc-badge" style="display:none; color:var(--accent); font-size:0.7rem;">VOICE LIVE</span>
                 <button class="btn-icon" onclick="joinVoice()" id="join-vc-btn">🎤</button>
             </div>
         </header>
-
         <div id="chat-feed"></div>
-
         <div class="input-wrapper">
             <button class="btn-icon" onclick="document.getElementById('file-input').click()">+</button>
             <input type="file" id="file-input" hidden onchange="handleFile()">
@@ -565,327 +383,129 @@ html_content = """
             <button class="btn-icon" style="background:var(--primary); border-color:var(--primary)" onclick="sendMessage()">➤</button>
         </div>
     </div>
-
     <div id="vc-panel">
-        <div style="padding:15px; border-bottom:1px solid rgba(255,255,255,0.1); font-size:0.8rem; font-weight:700;">VOICE LINK</div>
-        <div class="vc-grid" id="vc-grid"></div>
+        <div style="padding:15px; border-bottom:1px solid rgba(255,255,255,0.1); font-size:0.8rem;">VOICE LINK</div>
+        <div id="vc-grid" style="padding:15px; display:grid; grid-template-columns:repeat(4,1fr); gap:10px;"></div>
         <div style="padding:15px; display:flex; justify-content:center; gap:15px;">
             <button class="btn-icon" onclick="toggleMute()" id="mute-btn">🎙️</button>
-            <button class="btn-icon" style="background:#ff4444; border-color:#ff4444" onclick="leaveVoice()">✖</button>
+            <button class="btn-icon" style="background:#ff4444;" onclick="leaveVoice()">✖</button>
         </div>
     </div>
-
     <div id="audio-container" hidden></div>
-
     <script>
         const state = {
             user: localStorage.getItem("kv9_user") || "",
             uid: localStorage.getItem("kv9_uid") || "u_" + Math.random().toString(36).substr(2, 8),
             pfp: localStorage.getItem("kv9_pfp") || `https://ui-avatars.com/api/?background=random&color=fff&name=User`,
-            group: "Lobby",
-            dmTarget: null,
-            ws: null,
-            dms: {},
-            users: []
+            group: "Lobby", dmTarget: null, ws: null, dms: {}
         };
         localStorage.setItem("kv9_uid", state.uid);
-
-        if(window.innerWidth < 768) document.getElementById('close-side').style.display='block';
-
-        window.onload = () => {
-            initBackground();
-            document.getElementById('preview-pfp').src = state.pfp;
-            if(state.user) document.getElementById('username-input').value = state.user;
-        };
-
+        window.onload = () => { initBackground(); document.getElementById('preview-pfp').src = state.pfp; if(state.user) document.getElementById('username-input').value = state.user; };
         async function uploadPfp() {
             const f = document.getElementById('pfp-upload').files[0];
             if(!f) return;
             const fd = new FormData(); fd.append('file', f);
-            try {
-                const r = await fetch('/api/upload', {method:'POST', body:fd});
-                const d = await r.json();
-                state.pfp = d.url;
-                document.getElementById('preview-pfp').src = state.pfp;
-            } catch(e){}
+            try { const r = await fetch('/api/upload', {method:'POST', body:fd}); const d = await r.json(); state.pfp = d.url; document.getElementById('preview-pfp').src = state.pfp; } catch(e){}
         }
-
         function connectToServer() {
             const n = document.getElementById('username-input').value.trim();
             if(!n) return;
             state.user = n;
             localStorage.setItem("kv9_user", n);
             localStorage.setItem("kv9_pfp", state.pfp);
-            updateProfileUI();
-            initConnection();
-        }
-
-        function updateProfileUI() {
             document.getElementById('side-pfp').src = state.pfp;
             document.getElementById('side-name').innerText = state.user;
+            loadGroups(); connect(state.group);
         }
-
         function toggleSidebar() { document.getElementById('sidebar').classList.toggle('open'); }
-
-        function initConnection() {
-            loadGroups();
-            connect(state.group);
-        }
-
         async function loadGroups() {
-            const r = await fetch('/api/groups');
-            const d = await r.json();
-            const l = document.getElementById('group-list');
-            l.innerHTML = '';
+            const r = await fetch('/api/groups'); const d = await r.json();
+            const l = document.getElementById('group-list'); l.innerHTML = '';
             d.groups.forEach(g => {
-                const el = document.createElement('div');
-                el.className = `nav-item ${g === state.group && !state.dmTarget ? 'active' : ''}`;
-                el.innerHTML = `<span># ${g}</span>`;
-                el.onclick = () => { switchChannel(g); };
+                const el = document.createElement('div'); el.className = `nav-item ${g === state.group && !state.dmTarget ? 'active' : ''}`;
+                el.innerHTML = `<span># ${g}</span>`; el.onclick = () => { state.dmTarget = null; state.group = g; connect(g); if(window.innerWidth < 768) toggleSidebar(); };
                 l.appendChild(el);
             });
         }
-
-        async function createGroup() {
-            const n = prompt("Channel Name:");
-            if(n) {
-                await fetch('/api/groups', {method:'POST', body:JSON.stringify({name:n}), headers:{'Content-Type':'application/json'}});
-                loadGroups();
-            }
-        }
-
-        function switchChannel(group) {
-            state.dmTarget = null;
-            state.group = group;
-            if(window.innerWidth < 768) toggleSidebar();
-            connect(group);
-        }
-
         function connect(group) {
             if(state.ws) state.ws.close();
-            leaveVoice();
             document.getElementById('setup-modal').style.display = 'none';
             document.getElementById('header-title').innerText = `# ${group}`;
             document.getElementById('chat-feed').innerHTML = '';
-            loadGroups();
-
-            fetch(`/api/history/${group}`).then(r=>r.json()).then(msgs => {
-                msgs.forEach(renderMessage);
-            });
-
+            fetch(`/api/history/${group}`).then(r=>r.json()).then(msgs => msgs.forEach(renderMessage));
             const proto = location.protocol === 'https:' ? 'wss' : 'ws';
             state.ws = new WebSocket(`${proto}://${location.host}/ws/${group}/${state.uid}`);
-
-            state.ws.onopen = () => {
-                state.ws.send(JSON.stringify({name: state.user, pfp: state.pfp}));
-                setInterval(() => { if(state.ws.readyState === 1) state.ws.send(JSON.stringify({type:"heartbeat"})); }, 30000);
-            };
-
+            state.ws.onopen = () => { state.ws.send(JSON.stringify({name: state.user, pfp: state.pfp})); setInterval(() => { if(state.ws.readyState === 1) state.ws.send(JSON.stringify({type:"heartbeat"})); }, 30000); };
             state.ws.onmessage = (e) => {
                 const d = JSON.parse(e.data);
-                if(d.type === "error" && d.message === "NAME_TAKEN") {
-                    document.getElementById('setup-modal').style.display = 'flex';
-                    document.getElementById('error-msg').style.display = 'block';
-                    state.ws.close();
-                }
-                else if(d.type === "message") { if(!state.dmTarget) renderMessage(d); }
+                if(d.type === "message") { if(!state.dmTarget) renderMessage(d); }
                 else if(d.type === "dm") handleIncomingDM(d);
-                else if(d.type === "presence_update") updateUsers(d.users);
                 else if(d.type === "vc_signal_group") handleVcSignal(d);
             };
         }
-
-        function startDM(uid, name, pfp) {
-            if(uid === state.uid) return;
-            state.dmTarget = {id: uid, name: name, pfp: pfp};
-            document.getElementById('header-title').innerText = `@ ${name}`;
-            document.getElementById('chat-feed').innerHTML = '';
-            if(state.dms[uid]) state.dms[uid].forEach(renderMessage);
-            if(window.innerWidth < 768) toggleSidebar();
-            updateDMList();
-        }
-
         function handleIncomingDM(d) {
             const peerId = d.sender_id === state.uid ? d.target_id : d.sender_id;
             if(!state.dms[peerId]) state.dms[peerId] = [];
             state.dms[peerId].push(d);
             if(state.dmTarget && state.dmTarget.id === peerId) renderMessage(d);
-            else updateDMList();
+            updateDMList();
         }
-
         function updateDMList() {
-            const l = document.getElementById('dm-list');
-            l.innerHTML = '';
+            const l = document.getElementById('dm-list'); l.innerHTML = '';
             Object.keys(state.dms).forEach(uid => {
-                const lastMsg = state.dms[uid][state.dms[uid].length-1];
-                const name = lastMsg.sender_id === uid ? lastMsg.sender_name : (state.dmTarget?.id === uid ? state.dmTarget.name : "User");
-                const el = document.createElement('div');
-                el.className = `nav-item ${state.dmTarget?.id === uid ? 'active' : ''}`;
-                el.innerHTML = `<span>@ ${name}</span> <div class="dm-badge"></div>`;
-                el.onclick = () => startDM(uid, name, "");
+                const el = document.createElement('div'); el.className = `nav-item ${state.dmTarget?.id === uid ? 'active' : ''}`;
+                el.innerHTML = `<span>@ ${uid.substr(0,8)}</span>`;
+                el.onclick = () => { state.dmTarget = {id: uid}; document.getElementById('chat-feed').innerHTML = ''; state.dms[uid].forEach(renderMessage); };
                 l.appendChild(el);
             });
         }
-
         function renderMessage(d) {
             const feed = document.getElementById('chat-feed');
-            const isMe = d.sender_id ? (d.sender_id === state.uid) : (d.user_id === state.uid);
-            const pfp = d.sender_pfp || d.user_pfp;
-            const name = d.sender_name || d.user_name;
-            const uid = d.sender_id || d.user_id;
-            const grp = document.createElement('div');
-            grp.className = `msg-group ${isMe ? 'me' : ''}`;
-            grp.innerHTML = `
-                <img class="msg-avatar" src="${pfp}" onclick="startDM('${uid}', '${name}', '${pfp}')">
-                <div class="msg-bubbles">
-                    <div class="msg-meta">${name}</div>
-                    <div class="bubble ${d.type === 'dm' ? 'dm-bubble' : ''}">
-                        ${d.text ? marked.parse(d.text) : ''}
-                        ${d.image_url ? `<img src="${d.image_url}">` : ''}
-                    </div>
-                </div>
-            `;
-            feed.appendChild(grp);
-            feed.scrollTop = feed.scrollHeight;
+            const isMe = (d.sender_id || d.user_id) === state.uid;
+            const grp = document.createElement('div'); grp.className = `msg-group ${isMe ? 'me' : ''}`;
+            grp.innerHTML = `<img class="msg-avatar" src="${d.sender_pfp || d.user_pfp || 'https://ui-avatars.com/api/?name=?'}"><div class="bubble">${d.text ? marked.parse(d.text) : ''}${d.image_url ? `<img src="${d.image_url}" style="max-width:100%; border-radius:8px;">` : ''}</div>`;
+            feed.appendChild(grp); feed.scrollTop = feed.scrollHeight;
         }
-
         function sendMessage() {
-            const inp = document.getElementById('msg-input');
-            const txt = inp.value.trim();
+            const inp = document.getElementById('msg-input'); const txt = inp.value.trim();
             if(!txt || !state.ws) return;
-            state.ws.send(JSON.stringify({
-                type: state.dmTarget ? "dm" : "message",
-                target_id: state.dmTarget?.id,
-                text: txt
-            }));
+            state.ws.send(JSON.stringify({ type: state.dmTarget ? "dm" : "message", target_id: state.dmTarget?.id, text: txt }));
             inp.value = '';
         }
-
-        document.getElementById('msg-input').addEventListener('keydown', e => { if(e.key === 'Enter') sendMessage(); });
-
         async function handleFile() {
-            const f = document.getElementById('file-input').files[0];
-            if(!f) return;
+            const f = document.getElementById('file-input').files[0]; if(!f) return;
             const fd = new FormData(); fd.append('file', f);
-            try {
-                const r = await fetch('/api/upload', {method:'POST', body:fd});
-                const res = await r.json();
-                state.ws.send(JSON.stringify({
-                    type: state.dmTarget ? "dm" : "message",
-                    target_id: state.dmTarget?.id,
-                    text: "",
-                    image_url: res.url
-                }));
-            } catch(e){}
+            const r = await fetch('/api/upload', {method:'POST', body:fd}); const res = await r.json();
+            state.ws.send(JSON.stringify({ type: state.dmTarget ? "dm" : "message", target_id: state.dmTarget?.id, text: "", image_url: res.url }));
         }
-
-        function updateUsers(users) { state.users = users; }
-
-        let peer = null, myStream = null, calls = {}, inVc = false;
-
+        let peer = null, myStream = null, inVc = false;
         async function joinVoice() {
-            try { myStream = await navigator.mediaDevices.getUserMedia({audio: true}); } catch(e) { return; }
-            inVc = true;
+            myStream = await navigator.mediaDevices.getUserMedia({audio: true}); inVc = true;
             document.getElementById('vc-panel').style.display = 'flex';
-            document.getElementById('vc-badge').style.display = 'block';
-            document.getElementById('join-vc-btn').style.display = 'none';
             peer = new Peer(state.uid);
-            peer.on('open', () => {
-                state.ws.send(JSON.stringify({type: "vc_join"}));
-                addVcSlot(state.uid, state.user, state.pfp);
-            });
+            peer.on('open', () => state.ws.send(JSON.stringify({type: "vc_join"})));
             peer.on('call', call => {
                 call.answer(myStream);
-                calls[call.peer] = call;
-                handleStream(call);
+                call.on('stream', s => { const a = document.createElement('audio'); a.srcObject = s; a.autoplay = true; document.getElementById('audio-container').appendChild(a); });
             });
         }
-
         function handleVcSignal(d) {
-            if(!inVc) return;
-            if(d.subtype === "vc_leave") { removeVcUser(d.sender_id); return; }
+            if(!inVc || d.sender_id === state.uid) return;
             if(d.type === "vc_join") {
-                addVcSlot(d.sender_id, d.user_name, d.user_pfp);
-                if(d.sender_id !== state.uid) {
-                    const call = peer.call(d.sender_id, myStream);
-                    calls[d.sender_id] = call;
-                    handleStream(call);
-                }
-            }
-            if(d.type === "vc_talking") {
-                const el = document.getElementById(`vc-u-${d.sender_id}`);
-                if(el) { el.classList.add('talking'); setTimeout(()=>el.classList.remove('talking'), 200); }
+                const call = peer.call(d.sender_id, myStream);
+                call.on('stream', s => { const a = document.createElement('audio'); a.srcObject = s; a.autoplay = true; document.getElementById('audio-container').appendChild(a); });
             }
         }
-
-        function handleStream(call) {
-            call.on('stream', remoteStream => {
-                if(document.getElementById(`aud-${call.peer}`)) return;
-                const aud = document.createElement('audio');
-                aud.id = `aud-${call.peer}`; aud.srcObject = remoteStream;
-                aud.autoplay = true; aud.playsInline = true;
-                document.getElementById('audio-container').appendChild(aud);
-            });
-        }
-
-        function addVcSlot(uid, name, pfp) {
-            if(document.getElementById(`vc-u-${uid}`)) return;
-            const d = document.createElement('div');
-            d.className = 'vc-slot'; d.id = `vc-u-${uid}`;
-            d.innerHTML = `<img src="${pfp}"><span>${name.substr(0,6)}</span>`;
-            document.getElementById('vc-grid').appendChild(d);
-        }
-
-        function removeVcUser(uid) {
-            const el = document.getElementById(`vc-u-${uid}`); if(el) el.remove();
-            const aud = document.getElementById(`aud-${uid}`); if(aud) aud.remove();
-            if(calls[uid]) { calls[uid].close(); delete calls[uid]; }
-        }
-
-        function leaveVoice() {
-            if(!inVc) return;
-            inVc = false;
-            state.ws.send(JSON.stringify({type: "vc_leave"}));
-            if(peer) peer.destroy();
-            if(myStream) myStream.getTracks().forEach(t => t.stop());
-            document.getElementById('vc-panel').style.display = 'none';
-            document.getElementById('vc-badge').style.display = 'none';
-            document.getElementById('join-vc-btn').style.display = 'flex';
-            document.getElementById('vc-grid').innerHTML = '';
-            calls = {};
-        }
-
-        function toggleMute() {
-            const track = myStream.getAudioTracks()[0];
-            track.enabled = !track.enabled;
-            document.getElementById('mute-btn').style.opacity = track.enabled ? 1 : 0.5;
-        }
-
+        function leaveVoice() { location.reload(); }
+        function toggleMute() { myStream.getAudioTracks()[0].enabled = !myStream.getAudioTracks()[0].enabled; }
         function initBackground() {
-            const canvas = document.getElementById('infra-canvas');
-            const ctx = canvas.getContext('2d');
-            let w, h, nodes = [];
-            function resize() { w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; }
-            window.addEventListener('resize', resize); resize();
-            class Node {
-                constructor() { this.x=Math.random()*w; this.y=Math.random()*h; this.vx=(Math.random()-.5); this.vy=(Math.random()-.5); }
-                update() { this.x+=this.vx; this.y+=this.vy; if(this.x<0||this.x>w)this.vx*=-1; if(this.y<0||this.y>h)this.vy*=-1; }
-            }
-            for(let i=0;i<30;i++) nodes.push(new Node());
+            const canvas = document.getElementById('infra-canvas'); const ctx = canvas.getContext('2d');
+            let w, h; const resize = () => { w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; };
+            window.onresize = resize; resize();
+            const nodes = Array.from({length: 30}, () => ({x: Math.random()*w, y: Math.random()*h, vx: Math.random()-0.5, vy: Math.random()-0.5}));
             function animate() {
-                ctx.clearRect(0,0,w,h);
-                ctx.fillStyle = '#7000ff';
-                for(let i=0; i<nodes.length; i++) {
-                    nodes[i].update();
-                    ctx.beginPath(); ctx.arc(nodes[i].x, nodes[i].y, 2, 0, Math.PI*2); ctx.fill();
-                    for(let j=i+1; j<nodes.length; j++) {
-                        let d = Math.hypot(nodes[i].x-nodes[j].x, nodes[i].y-nodes[j].y);
-                        if(d<150) {
-                            ctx.beginPath(); ctx.moveTo(nodes[i].x,nodes[i].y); ctx.lineTo(nodes[j].x,nodes[j].y);
-                            ctx.strokeStyle=`rgba(112,0,255,${1-d/150})`; ctx.stroke();
-                        }
-                    }
-                }
+                ctx.clearRect(0,0,w,h); ctx.fillStyle = '#7000ff';
+                nodes.forEach(n => { n.x += n.vx; n.y += n.vy; if(n.x<0||n.x>w) n.vx*=-1; if(n.y<0||n.y>h) n.vy*=-1; ctx.beginPath(); ctx.arc(n.x, n.y, 2, 0, 7); ctx.fill(); });
                 requestAnimationFrame(animate);
             }
             animate();
@@ -893,3 +513,4 @@ html_content = """
     </script>
 </body>
 </html>
+"""
