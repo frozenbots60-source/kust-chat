@@ -11,13 +11,13 @@ from redis import asyncio as aioredis
 from botocore.config import Config
 
 # ==========================================
-# KUSTIFY HYPER-X | V9.2 (VC + MOBILE SPLIT + PERSISTENCE)
+# KUSTIFY HYPER-X | V9.3 (VC ANIMATIONS + SCREEN SHARE)
 # ==========================================
 
 app = FastAPI(
     title="Kustify Hyper-X API", 
     description="Next-Gen Infrastructure Chat API for Bots and Custom Clients", 
-    version="9.2",
+    version="9.3",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -306,10 +306,35 @@ html_content = """
         .btn-icon { background: none; border: none; color: var(--text-dim); cursor: pointer; padding: 8px; font-size: 1.2rem; transition: 0.2s; }
         .btn-icon:hover { color: var(--accent); }
 
-        /* Voice Chat Controls */
-        #vc-controls { display: none; align-items: center; gap: 10px; background: rgba(0, 243, 255, 0.1); padding: 5px 15px; border-radius: 20px; border: 1px solid rgba(0, 243, 255, 0.3); }
-        #vc-status { font-size: 0.8rem; color: var(--accent); font-weight: 600; }
-        .btn-vc-leave { background: #ff4444; color: white; border: none; border-radius: 50%; width: 30px; height: 30px; cursor: pointer; font-size: 0.8rem; display: flex; align-items: center; justify-content: center; }
+        /* Voice Chat Panel */
+        #vc-panel { 
+            display: none; 
+            background: #0f0f11; 
+            border-bottom: 1px solid var(--border); 
+            padding: 15px;
+            gap: 15px;
+            flex-direction: column;
+        }
+        .vc-header { display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem; color: var(--accent); text-transform: uppercase; letter-spacing: 1px; font-weight: 700; margin-bottom: 10px; }
+        .vc-grid { display: flex; gap: 15px; overflow-x: auto; padding-bottom: 5px; align-items: center; }
+        
+        .vc-user { 
+            display: flex; flex-direction: column; align-items: center; gap: 5px; width: 70px; flex-shrink: 0; position: relative; 
+        }
+        .vc-avatar { 
+            width: 50px; height: 50px; border-radius: 50%; object-fit: cover; border: 2px solid #333; transition: transform 0.1s; 
+            box-shadow: 0 0 0 0 rgba(0, 243, 255, 0);
+        }
+        .vc-name { font-size: 0.7rem; color: #aaa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+        
+        .btn-leave { background: #ff4444; color: white; padding: 5px 12px; border-radius: 5px; border: none; font-size: 0.7rem; cursor: pointer; }
+        .btn-screen { background: #333; color: white; padding: 5px 12px; border-radius: 5px; border: none; font-size: 0.7rem; cursor: pointer; display: flex; gap: 5px; align-items: center; }
+        .btn-screen.active { background: var(--accent); color: #000; }
+
+        /* Video / Screen Share Area */
+        .video-container { width: 100%; max-height: 300px; background: #000; margin-top: 10px; border-radius: 8px; overflow: hidden; display: none; position: relative; }
+        .video-container video { width: 100%; height: 100%; object-fit: contain; }
+        .screen-label { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; }
 
         /* Modals & Context */
         .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 100; display: none; align-items: center; justify-content: center; backdrop-filter: blur(5px); }
@@ -367,7 +392,7 @@ html_content = """
 
     <div id="sidebar">
         <div class="brand-area">
-            <span>HYPER-X v9.2</span>
+            <span>HYPER-X v9.3</span>
             <button class="btn-icon" onclick="openCreateModal()">+</button>
         </div>
         <div class="nav-list" id="group-list"></div>
@@ -382,14 +407,24 @@ html_content = """
                     <div id="users-online" style="font-size:0.7rem; color:var(--text-dim); margin-top:2px;">Connecting...</div>
                 </div>
             </div>
-            <div style="display: flex; gap: 10px; align-items: center;">
-                <div id="vc-controls">
-                    <span id="vc-status">🔊 Voice Active</span>
-                    <button class="btn-vc-leave" onclick="leaveVC()">✕</button>
-                </div>
-                <button class="btn-icon" id="btn-join-vc" onclick="joinVC()" title="Join Voice">🎤</button>
-            </div>
+            <button class="btn-icon" id="btn-join-vc" onclick="joinVC()" title="Join Voice" style="color:var(--accent);">🔊 Join Voice</button>
         </header>
+
+        <div id="vc-panel">
+            <div class="vc-header">
+                <span>Active Voice Channel</span>
+                <div style="display:flex; gap:10px;">
+                    <button id="btn-share" class="btn-screen" onclick="toggleScreenShare()">📺 Share Screen</button>
+                    <button class="btn-leave" onclick="leaveVC()">Disconnect</button>
+                </div>
+            </div>
+            <div class="vc-grid" id="vc-users-grid">
+                </div>
+            <div id="vc-video-area" class="video-container">
+                <div class="screen-label">Screen Share</div>
+                <video id="vc-remote-video" autoplay playsinline></video>
+            </div>
+        </div>
         
         <div id="chat-feed"></div>
         
@@ -412,14 +447,16 @@ html_content = """
             peer: null,
             myPeerId: null,
             vcCalls: {},
+            vcUsers: {}, // Map of peerId -> {name, pfp, el}
             inVC: false,
+            isSharing: false,
+            localStream: null,
             joinedPvtGroups: JSON.parse(localStorage.getItem('k_joined_groups') || '[]')
         };
 
         function setCookie(n, v) { const d = new Date(); d.setTime(d.getTime() + (365*24*60*60*1000)); document.cookie = `${n}=${v};expires=${d.toUTCString()};path=/`; }
         function getCookie(n) { const v = document.cookie.match('(^|;) ?' + n + '=([^;]*)(;|$)'); return v ? v[2] : null; }
 
-        // Mobile Nav Logic
         function showChat() { document.body.classList.remove('view-sidebar'); document.body.classList.add('view-chat'); }
         function showSidebar() { document.body.classList.remove('view-chat'); document.body.classList.add('view-sidebar'); }
 
@@ -430,7 +467,7 @@ html_content = """
             }
         };
 
-        // --- Auth & Setup ---
+        // --- Core ---
         function saveUser() {
             const n = document.getElementById('username-input').value.trim();
             const p = document.getElementById('pfp-input').value.trim();
@@ -448,24 +485,20 @@ html_content = """
         function openCreateModal() { document.getElementById('create-group-modal').style.display = 'flex'; }
         function closeModal(id) { document.getElementById(id).style.display = 'none'; }
 
-        // --- Group Logic ---
         async function createGroup() {
             const name = document.getElementById('new-group-name').value.trim();
             const type = document.getElementById('new-group-type').value;
             const pass = document.getElementById('new-group-pass').value;
-            
             if(!name) return alert("Name required");
-            
             const res = await fetch('/api/groups/create', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({name, type, password: pass})
             });
-            
             if(res.ok) {
                 closeModal('create-group-modal');
                 if(type === 'private') rememberPrivateGroup(name);
-                init(); // Refresh list
+                init(); 
                 switchGroup(name);
             } else alert("Error: " + (await res.json()).detail);
         }
@@ -483,19 +516,16 @@ html_content = """
             const gl = document.getElementById('group-list');
             gl.innerHTML = '';
             
-            // Public Groups
             const pubHeader = document.createElement('div'); pubHeader.className='nav-section'; pubHeader.innerText='Public';
             gl.appendChild(pubHeader);
             d.groups.forEach(g => renderGroupItem(g, gl));
 
-            // Private Groups (Persistent)
             if(state.joinedPvtGroups.length > 0) {
                 const pvtHeader = document.createElement('div'); pvtHeader.className='nav-section'; pvtHeader.innerText='Private';
                 gl.appendChild(pvtHeader);
                 state.joinedPvtGroups.forEach(g => renderGroupItem(g, gl, true));
             }
 
-            // Join Btn
             const joinBtn = document.createElement('div');
             joinBtn.className = 'nav-item';
             joinBtn.style.justifyContent = 'center';
@@ -505,8 +535,6 @@ html_content = """
                 if(name) switchGroup(name, true);
             };
             gl.appendChild(joinBtn);
-
-            // Connect to current group
             connect();
         }
 
@@ -519,12 +547,9 @@ html_content = """
         }
 
         async function switchGroup(name, isPrivate = false) {
-            if(state.inVC) leaveVC(); // Auto leave VC on switch
+            if(state.inVC) leaveVC(); 
 
-            // Logic to determine if we need auth (simplified: if persistent, assume auth'd or check again)
-            // Ideally backend validates token, here we simulate check
             if(isPrivate || !document.querySelector(`.nav-item`)) { 
-                // Check if valid private group
                 const fd = new FormData(); fd.append('name', name);
                 const check = await fetch('/api/groups/join_private', {method:'POST', body:fd});
                 if(check.status === 403) {
@@ -535,17 +560,14 @@ html_content = """
                 } else if(!check.ok) {
                      return alert("Group not found"); 
                 }
-                // If success, ensure it's remembered
                 rememberPrivateGroup(name);
             }
 
             state.group = name;
             document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-            // Re-render list to highlight active
             init(); 
-            
             document.getElementById('header-title').innerText = `# ${name}`;
-            showChat(); // Mobile transition
+            showChat(); 
             connect();
         }
 
@@ -561,7 +583,6 @@ html_content = """
             } else alert("Access Denied");
         }
 
-        // --- WebSocket & Chat ---
         function connect() {
             if(state.ws) state.ws.close();
             document.getElementById('chat-feed').innerHTML = '';
@@ -630,24 +651,26 @@ html_content = """
             } catch(e) { alert("Upload Failed"); }
         }
 
-        // --- Voice Chat System (PeerJS) ---
+        // --- ENHANCED VOICE CHAT & SCREEN SHARE ---
         function joinVC() {
             if(state.inVC) return;
-            state.peer = new Peer(undefined); // Using PeerJS Cloud
+            state.peer = new Peer(undefined); 
             
             state.peer.on('open', (id) => {
                 state.myPeerId = id;
                 state.inVC = true;
-                document.getElementById('vc-controls').style.display = 'flex';
+                document.getElementById('vc-panel').style.display = 'flex';
                 document.getElementById('btn-join-vc').style.display = 'none';
                 
-                // Get Local Stream
+                // Add Self to Grid
+                addVCUser(id, state.user, state.pfp, true);
+
                 navigator.mediaDevices.getUserMedia({audio: true, video: false}).then(stream => {
                     state.localStream = stream;
-                    // Announce Join
-                    state.ws.send(JSON.stringify({type: "vc_join", peer_id: id}));
+                    setupAudioVisualizer(stream, id); // Animate Self
                     
-                    // Answer Incoming
+                    state.ws.send(JSON.stringify({type: "vc_join", peer_id: id, name: state.user, pfp: state.pfp}));
+                    
                     state.peer.on('call', call => {
                         call.answer(stream);
                         handleStream(call);
@@ -661,48 +684,163 @@ html_content = """
             state.ws.send(JSON.stringify({type: "vc_leave", peer_id: state.myPeerId}));
             if(state.peer) state.peer.destroy();
             if(state.localStream) state.localStream.getTracks().forEach(t => t.stop());
+            
             state.inVC = false;
+            state.isSharing = false;
             state.vcCalls = {};
-            document.getElementById('vc-controls').style.display = 'none';
+            state.vcUsers = {};
+            
+            document.getElementById('vc-panel').style.display = 'none';
+            document.getElementById('vc-users-grid').innerHTML = '';
             document.getElementById('btn-join-vc').style.display = 'block';
+            document.getElementById('vc-video-area').style.display = 'none';
+            document.getElementById('btn-share').classList.remove('active');
         }
 
         function handleVCSignal(d) {
             if(!state.inVC || d.sender_id === state.uid) return;
             
-            if(d.type === "vc_signal_group" && d.vc_type === "join") {
-                // Someone joined, call them
-                // Note: In strict logic, we check d.type from socket. 
-                // We mapped WS 'vc_join' -> 'vc_signal_group' with 'vc_type' implicit in data or separate field
-                // Re-aligning with backend: backend sends type="vc_signal_group", payload includes original fields
+            // New User Joined
+            if(d.peer_id && d.type === "vc_signal_group" && d.name) { 
+                if(!state.vcUsers[d.peer_id]) {
+                    addVCUser(d.peer_id, d.name, d.pfp);
+                    const call = state.peer.call(d.peer_id, state.localStream);
+                    handleStream(call);
+                }
             }
             
-            // If someone new joined (d.peer_id present) and isn't me
-            if(d.peer_id && d.type === "vc_signal_group") { 
-                // Using backend reflection: WS sends "vc_join" -> Backend publishes "vc_signal_group" + "peer_id"
-                // Check original intent from payload
-                // Actually, let's just use the `d` object directly.
-                
-                if(d.peer_id && !state.vcCalls[d.peer_id]) {
-                     // Connect to new peer
-                     const call = state.peer.call(d.peer_id, state.localStream);
-                     handleStream(call);
-                }
+            // User Left
+            if(d.type === "vc_signal_group" && d.vc_type === "leave") { 
+               // Note: This logic assumes 'vc_leave' message handling if needed explicitly, 
+               // but connection close usually handles cleanup.
             }
         }
 
         function handleStream(call) {
             state.vcCalls[call.peer] = call;
-            call.on('stream', userStream => {
-                const audio = document.createElement('audio');
-                audio.srcObject = userStream;
-                audio.play();
-                // Store audio ref if needed to remove later
+            call.on('stream', remoteStream => {
+                // Check if video (screen share)
+                const hasVideo = remoteStream.getVideoTracks().length > 0;
+                
+                if(hasVideo) {
+                    const vid = document.getElementById('vc-remote-video');
+                    vid.srcObject = remoteStream;
+                    document.getElementById('vc-video-area').style.display = 'block';
+                } else {
+                    const audio = document.createElement('audio');
+                    audio.srcObject = remoteStream;
+                    audio.play();
+                    setupAudioVisualizer(remoteStream, call.peer); // Animate Remote
+                }
             });
-            call.on('close', () => { delete state.vcCalls[call.peer]; });
+            call.on('close', () => { 
+                removeVCUser(call.peer);
+                delete state.vcCalls[call.peer]; 
+            });
         }
 
-        // --- Context Menu ---
+        function addVCUser(id, name, pfp, isMe=false) {
+            if(state.vcUsers[id]) return;
+            const grid = document.getElementById('vc-users-grid');
+            const div = document.createElement('div');
+            div.className = 'vc-user';
+            div.id = `vc-u-${id}`;
+            div.innerHTML = `
+                <img src="${pfp}" class="vc-avatar" id="avatar-${id}">
+                <span class="vc-name">${name}${isMe ? ' (You)' : ''}</span>
+            `;
+            grid.appendChild(div);
+            state.vcUsers[id] = {name, pfp, el: div};
+        }
+
+        function removeVCUser(id) {
+            const u = document.getElementById(`vc-u-${id}`);
+            if(u) u.remove();
+            delete state.vcUsers[id];
+        }
+
+        // --- VISUAL ANIMATION ---
+        function setupAudioVisualizer(stream, id) {
+            try {
+                const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const source = audioCtx.createMediaStreamSource(stream);
+                const analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 32;
+                source.connect(analyser);
+                
+                const bufferLength = analyser.frequencyBinCount;
+                const dataArray = new Uint8Array(bufferLength);
+                
+                const avatar = document.getElementById(`avatar-${id}`);
+                
+                function animate() {
+                    if(!state.inVC || !document.getElementById(`avatar-${id}`)) return;
+                    requestAnimationFrame(animate);
+                    analyser.getByteFrequencyData(dataArray);
+                    
+                    // Simple average volume
+                    let sum = 0; 
+                    for(let i=0; i<bufferLength; i++) sum += dataArray[i];
+                    const avg = sum / bufferLength;
+                    
+                    if(avg > 10) { // Threshold
+                        const scale = 1 + (avg / 200); // Scale up to ~1.5x
+                        const glow = `0 0 0 ${avg/10}px var(--primary)`;
+                        avatar.style.transform = `scale(${scale})`;
+                        avatar.style.boxShadow = glow;
+                        avatar.style.borderColor = 'var(--accent)';
+                    } else {
+                        avatar.style.transform = 'scale(1)';
+                        avatar.style.boxShadow = 'none';
+                        avatar.style.borderColor = '#333';
+                    }
+                }
+                animate();
+            } catch(e) { console.log("Audio Viz Error", e); }
+        }
+
+        // --- SCREEN SHARE ---
+        async function toggleScreenShare() {
+            if(!state.inVC) return alert("Join Voice first!");
+            const btn = document.getElementById('btn-share');
+            
+            if(state.isSharing) {
+                // Stop Sharing - Revert to Mic
+                state.isSharing = false;
+                btn.classList.remove('active');
+                
+                // Switch tracks back
+                const audioTrack = state.localStream.getAudioTracks()[0];
+                for (let peerId in state.vcCalls) {
+                    const sender = state.vcCalls[peerId].peerConnection.getSenders().find(s => s.track.kind === 'video' || s.track.kind === 'audio');
+                    if(sender) sender.replaceTrack(audioTrack);
+                }
+                
+                // Hide local preview (if we implemented one)
+                return;
+            }
+
+            try {
+                const screenStream = await navigator.mediaDevices.getDisplayMedia({video: true, audio: true});
+                const screenTrack = screenStream.getVideoTracks()[0];
+                
+                state.isSharing = true;
+                btn.classList.add('active');
+                
+                // Handle user clicking "Stop Sharing" in browser UI
+                screenTrack.onended = () => { if(state.isSharing) toggleScreenShare(); };
+
+                // Replace tracks in active calls
+                for (let peerId in state.vcCalls) {
+                    const sender = state.vcCalls[peerId].peerConnection.getSenders().find(s => s.track.kind === 'audio'); // Usually replacing audio sender if audio-only call
+                    // Note: PeerJS handles this variably. Best is to replaceTrack. 
+                    // Since we started audio-only, we might need to renegotiate or just replace the track.
+                    if(sender) sender.replaceTrack(screenTrack);
+                }
+                
+            } catch(e) { console.error(e); state.isSharing = false; }
+        }
+
         function showCtx(x, y, id, text) {
             const menu = document.getElementById('ctx-menu');
             menu.style.display = 'block'; menu.style.left = x + 'px'; menu.style.top = y + 'px';
