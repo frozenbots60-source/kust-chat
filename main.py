@@ -651,7 +651,7 @@ html_content = """
             } catch(e) { alert("Upload Failed"); }
         }
 
-        # --- ENHANCED VOICE CHAT & SCREEN SHARE ---
+        // --- ENHANCED VOICE CHAT & SCREEN SHARE ---
         function joinVC() {
             if(state.inVC) return;
             state.peer = new Peer(undefined); 
@@ -668,7 +668,7 @@ html_content = """
                     state.localStream = stream;
                     setupAudioVisualizer(stream, id);
                     
-                    # Notify others and request a sync so already joined users show up for us
+                    // Notify others and request a sync so already joined users show up for us
                     state.ws.send(JSON.stringify({
                         type: "vc_join", 
                         peer_id: id, 
@@ -706,7 +706,7 @@ html_content = """
         function handleVCSignal(d) {
             if(!state.inVC || d.sender_id === state.uid) return;
             
-            # Case 1: A new user just joined (or an old user is replying to our join request)
+            // Case 1: A new user just joined (or an old user is replying to our join request)
             if(d.peer_id && d.type === "vc_signal_group" && d.name) { 
                 if(!state.vcUsers[d.peer_id]) {
                     addVCUser(d.peer_id, d.name, d.pfp);
@@ -714,8 +714,8 @@ html_content = """
                     handleStream(call);
                 }
                 
-                # Case 2: We just joined, and this person is already here. 
-                # If they sent request_sync, we must reply with our presence so they see us.
+                // Case 2: We just joined, and this person is already here. 
+                // If they sent request_sync, we must reply with our presence so they see us.
                 if(d.request_sync) {
                     state.ws.send(JSON.stringify({
                         type: "vc_join", 
@@ -857,4 +857,3 @@ html_content = """
     </script>
 </body>
 </html>
-"""
