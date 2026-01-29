@@ -11,7 +11,7 @@ from redis import asyncio as aioredis
 from botocore.config import Config
 
 # ==========================================
-# KUSTIFY HYPER-X | V9.3 (VC ANIMATIONS + SCREEN SHARE)
+# KUSTIFY HYPER-X | V9.3 (VC ANIMATIONS + SCREEN SHARE + FIXES)
 # ==========================================
 
 app = FastAPI(
@@ -233,8 +233,9 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
                         break
             
             # --- Voice Chat Signaling ---
-            elif mtype in ["vc_join", "vc_leave", "vc_signal"]:
-                data.update({"sender_id": user_id, "group_id": group_id})
+            # FIXED: Added 'vc_state' to allowed types and preserving 'vc_action'
+            elif mtype in ["vc_join", "vc_leave", "vc_signal", "vc_state"]:
+                data.update({"sender_id": user_id, "group_id": group_id, "vc_action": mtype})
                 # Broadcast signals to group so peers can connect
                 await redis.publish(GLOBAL_CHANNEL, json.dumps({**data, "type": "vc_signal_group"}))
 
@@ -697,22 +698,37 @@ html_content = """
             document.getElementById('btn-share').classList.remove('active');
         }
 
+        // FIXED: Explicitly handle Join, State, and Leave with Handshake Logic
         function handleVCSignal(d) {
             if(!state.inVC || d.sender_id === state.uid) return;
             
-            // New User Joined
-            if(d.peer_id && d.type === "vc_signal_group" && d.name) { 
+            // Case 1: New User Joined -> Add them, Call them, and Send my State back
+            if(d.vc_action === "vc_join" && d.peer_id) { 
                 if(!state.vcUsers[d.peer_id]) {
                     addVCUser(d.peer_id, d.name, d.pfp);
                     const call = state.peer.call(d.peer_id, state.localStream);
                     handleStream(call);
+                    
+                    // Respond so new user sees me
+                    state.ws.send(JSON.stringify({
+                        type: "vc_state", 
+                        peer_id: state.myPeerId, 
+                        name: state.user, 
+                        pfp: state.pfp 
+                    }));
                 }
             }
             
-            // User Left
-            if(d.type === "vc_signal_group" && d.vc_type === "leave") { 
-               // Note: This logic assumes 'vc_leave' message handling if needed explicitly, 
-               // but connection close usually handles cleanup.
+            // Case 2: Existing User Response -> Just Add them
+            if(d.vc_action === "vc_state" && d.peer_id) {
+                if(!state.vcUsers[d.peer_id]) {
+                    addVCUser(d.peer_id, d.name, d.pfp);
+                }
+            }
+
+            // Case 3: User Left
+            if(d.vc_action === "vc_leave" && d.peer_id) { 
+                removeVCUser(d.peer_id);
             }
         }
 
@@ -859,4 +875,3 @@ html_content = """
     </script>
 </body>
 </html>
-"""
