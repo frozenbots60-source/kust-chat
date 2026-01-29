@@ -11,7 +11,7 @@ from redis import asyncio as aioredis
 from botocore.config import Config
 
 # ==========================================
-# KUSTIFY HYPER-X | V9.3 (VC ANIMATIONS + SCREEN SHARE + FIXES)
+# KUSTIFY HYPER-X | V9.3 (VC ANIMATIONS + SCREEN SHARE)
 # ==========================================
 
 app = FastAPI(
@@ -233,9 +233,8 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
                         break
             
             # --- Voice Chat Signaling ---
-            # FIXED: Added 'vc_state' to allowed types and preserving 'vc_action'
-            elif mtype in ["vc_join", "vc_leave", "vc_signal", "vc_state"]:
-                data.update({"sender_id": user_id, "group_id": group_id, "vc_action": mtype})
+            elif mtype in ["vc_join", "vc_leave", "vc_signal"]:
+                data.update({"sender_id": user_id, "group_id": group_id})
                 # Broadcast signals to group so peers can connect
                 await redis.publish(GLOBAL_CHANNEL, json.dumps({**data, "type": "vc_signal_group"}))
 
@@ -652,7 +651,7 @@ html_content = """
             } catch(e) { alert("Upload Failed"); }
         }
 
-        // --- ENHANCED VOICE CHAT & SCREEN SHARE ---
+        # --- ENHANCED VOICE CHAT & SCREEN SHARE ---
         function joinVC() {
             if(state.inVC) return;
             state.peer = new Peer(undefined); 
@@ -663,14 +662,20 @@ html_content = """
                 document.getElementById('vc-panel').style.display = 'flex';
                 document.getElementById('btn-join-vc').style.display = 'none';
                 
-                // Add Self to Grid
                 addVCUser(id, state.user, state.pfp, true);
 
                 navigator.mediaDevices.getUserMedia({audio: true, video: false}).then(stream => {
                     state.localStream = stream;
-                    setupAudioVisualizer(stream, id); // Animate Self
+                    setupAudioVisualizer(stream, id);
                     
-                    state.ws.send(JSON.stringify({type: "vc_join", peer_id: id, name: state.user, pfp: state.pfp}));
+                    # Notify others and request a sync so already joined users show up for us
+                    state.ws.send(JSON.stringify({
+                        type: "vc_join", 
+                        peer_id: id, 
+                        name: state.user, 
+                        pfp: state.pfp,
+                        request_sync: true 
+                    }));
                     
                     state.peer.on('call', call => {
                         call.answer(stream);
@@ -698,44 +703,34 @@ html_content = """
             document.getElementById('btn-share').classList.remove('active');
         }
 
-        // FIXED: Explicitly handle Join, State, and Leave with Handshake Logic
         function handleVCSignal(d) {
             if(!state.inVC || d.sender_id === state.uid) return;
             
-            // Case 1: New User Joined -> Add them, Call them, and Send my State back
-            if(d.vc_action === "vc_join" && d.peer_id) { 
+            # Case 1: A new user just joined (or an old user is replying to our join request)
+            if(d.peer_id && d.type === "vc_signal_group" && d.name) { 
                 if(!state.vcUsers[d.peer_id]) {
                     addVCUser(d.peer_id, d.name, d.pfp);
                     const call = state.peer.call(d.peer_id, state.localStream);
                     handleStream(call);
-                    
-                    // Respond so new user sees me
+                }
+                
+                # Case 2: We just joined, and this person is already here. 
+                # If they sent request_sync, we must reply with our presence so they see us.
+                if(d.request_sync) {
                     state.ws.send(JSON.stringify({
-                        type: "vc_state", 
+                        type: "vc_join", 
                         peer_id: state.myPeerId, 
                         name: state.user, 
-                        pfp: state.pfp 
+                        pfp: state.pfp,
+                        request_sync: false 
                     }));
                 }
-            }
-            
-            // Case 2: Existing User Response -> Just Add them
-            if(d.vc_action === "vc_state" && d.peer_id) {
-                if(!state.vcUsers[d.peer_id]) {
-                    addVCUser(d.peer_id, d.name, d.pfp);
-                }
-            }
-
-            // Case 3: User Left
-            if(d.vc_action === "vc_leave" && d.peer_id) { 
-                removeVCUser(d.peer_id);
             }
         }
 
         function handleStream(call) {
             state.vcCalls[call.peer] = call;
             call.on('stream', remoteStream => {
-                // Check if video (screen share)
                 const hasVideo = remoteStream.getVideoTracks().length > 0;
                 
                 if(hasVideo) {
@@ -746,7 +741,7 @@ html_content = """
                     const audio = document.createElement('audio');
                     audio.srcObject = remoteStream;
                     audio.play();
-                    setupAudioVisualizer(remoteStream, call.peer); // Animate Remote
+                    setupAudioVisualizer(remoteStream, call.peer);
                 }
             });
             call.on('close', () => { 
@@ -775,7 +770,6 @@ html_content = """
             delete state.vcUsers[id];
         }
 
-        // --- VISUAL ANIMATION ---
         function setupAudioVisualizer(stream, id) {
             try {
                 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -794,13 +788,12 @@ html_content = """
                     requestAnimationFrame(animate);
                     analyser.getByteFrequencyData(dataArray);
                     
-                    // Simple average volume
                     let sum = 0; 
                     for(let i=0; i<bufferLength; i++) sum += dataArray[i];
                     const avg = sum / bufferLength;
                     
-                    if(avg > 10) { // Threshold
-                        const scale = 1 + (avg / 200); // Scale up to ~1.5x
+                    if(avg > 10) { 
+                        const scale = 1 + (avg / 200);
                         const glow = `0 0 0 ${avg/10}px var(--primary)`;
                         avatar.style.transform = `scale(${scale})`;
                         avatar.style.boxShadow = glow;
@@ -815,24 +808,18 @@ html_content = """
             } catch(e) { console.log("Audio Viz Error", e); }
         }
 
-        // --- SCREEN SHARE ---
         async function toggleScreenShare() {
             if(!state.inVC) return alert("Join Voice first!");
             const btn = document.getElementById('btn-share');
             
             if(state.isSharing) {
-                // Stop Sharing - Revert to Mic
                 state.isSharing = false;
                 btn.classList.remove('active');
-                
-                // Switch tracks back
                 const audioTrack = state.localStream.getAudioTracks()[0];
                 for (let peerId in state.vcCalls) {
                     const sender = state.vcCalls[peerId].peerConnection.getSenders().find(s => s.track.kind === 'video' || s.track.kind === 'audio');
                     if(sender) sender.replaceTrack(audioTrack);
                 }
-                
-                // Hide local preview (if we implemented one)
                 return;
             }
 
@@ -842,15 +829,10 @@ html_content = """
                 
                 state.isSharing = true;
                 btn.classList.add('active');
-                
-                // Handle user clicking "Stop Sharing" in browser UI
                 screenTrack.onended = () => { if(state.isSharing) toggleScreenShare(); };
 
-                // Replace tracks in active calls
                 for (let peerId in state.vcCalls) {
-                    const sender = state.vcCalls[peerId].peerConnection.getSenders().find(s => s.track.kind === 'audio'); // Usually replacing audio sender if audio-only call
-                    // Note: PeerJS handles this variably. Best is to replaceTrack. 
-                    // Since we started audio-only, we might need to renegotiate or just replace the track.
+                    const sender = state.vcCalls[peerId].peerConnection.getSenders().find(s => s.track.kind === 'audio'); 
                     if(sender) sender.replaceTrack(screenTrack);
                 }
                 
@@ -875,3 +857,4 @@ html_content = """
     </script>
 </body>
 </html>
+"""
