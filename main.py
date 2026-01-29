@@ -11,7 +11,7 @@ from redis import asyncio as aioredis
 from botocore.config import Config
 
 # ==========================================
-# KUSTIFY HYPER-X | V9.3 (VC ANIMATIONS + SCREEN SHARE)
+# KUSTIFY HYPER-X | V9.3 (VC FIXED: DISCOVERY + DUPE PREVENTION)
 # ==========================================
 
 app = FastAPI(
@@ -232,8 +232,8 @@ async def websocket_endpoint(websocket: WebSocket, group_id: str, user_id: str):
                         await redis.publish(GLOBAL_CHANNEL, json.dumps({"type": "delete_message", "group_id": group_id, "id": msg_id}))
                         break
             
-            # --- Voice Chat Signaling ---
-            elif mtype in ["vc_join", "vc_leave", "vc_signal", "vc_ping"]:
+            # --- Voice Chat Signaling (Updated for State Sync) ---
+            elif mtype in ["vc_join", "vc_leave", "vc_signal", "vc_ping", "vc_request_state"]:
                 data.update({"sender_id": user_id, "group_id": group_id})
                 await redis.publish(GLOBAL_CHANNEL, json.dumps({**data, "type": "vc_signal_group"}))
 
@@ -670,8 +670,8 @@ html_content = """
                     // 1. Join the room
                     state.ws.send(JSON.stringify({type: "vc_join", peer_id: id, name: state.user, pfp: state.pfp}));
                     
-                    // 2. Announce presence so existing users can ping back
-                    state.ws.send(JSON.stringify({type: "vc_ping", peer_id: id, name: state.user, pfp: state.pfp}));
+                    // 2. Announce presence & ask who is here (FIX FOR NEW USER DISCOVERY)
+                    state.ws.send(JSON.stringify({type: "vc_request_state", peer_id: id}));
 
                     state.peer.on('call', call => {
                         call.answer(stream);
@@ -702,18 +702,21 @@ html_content = """
         function handleVCSignal(d) {
             if(!state.inVC || d.sender_id === state.uid) return;
             
-            // Someone pinged (they are new, we should call them) OR Someone joined
-            if(d.peer_id && (d.type === "vc_signal_group" || d.type === "vc_ping" || d.type === "vc_join") && d.name) { 
+            // --- FIX: Respond to State Request (If I am here, I tell the new user) ---
+            if(d.type === "vc_signal_group" && (d.vc_type === "request_state" || d.type === "vc_request_state")) {
+                state.ws.send(JSON.stringify({type: "vc_join", peer_id: state.myPeerId, name: state.user, pfp: state.pfp}));
+                return;
+            }
+
+            // Someone joined or pinged - Add them and CALL them if they are new
+            if(d.peer_id && (d.type === "vc_signal_group" || d.type === "vc_join" || d.type === "vc_ping") && d.name) { 
                 if(!state.vcUsers[d.peer_id]) {
                     addVCUser(d.peer_id, d.name, d.pfp);
-                }
-                
-                // If it was a join or ping signal, we call them to establish bidirectional connection
-                if(d.type === "vc_signal_group" && (d.vc_type === "join" || d.type === "vc_join" || d.type === "vc_ping")) {
-                   if(!state.vcCalls[d.peer_id]) {
+                    // Initiate the call to the new user so voice connects
+                    if(!state.vcCalls[d.peer_id]) {
                         const call = state.peer.call(d.peer_id, state.localStream);
                         handleStream(call);
-                   }
+                    }
                 }
             }
             
@@ -745,7 +748,9 @@ html_content = """
         }
 
         function addVCUser(id, name, pfp, isMe=false) {
+            // --- FIX: Strict Duplicate Check ---
             if(document.getElementById(`vc-u-${id}`)) return;
+            
             const grid = document.getElementById('vc-users-grid');
             const div = document.createElement('div');
             div.className = 'vc-user';
@@ -854,4 +859,3 @@ html_content = """
     </script>
 </body>
 </html>
-"""
